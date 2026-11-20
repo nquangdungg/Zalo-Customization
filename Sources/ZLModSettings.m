@@ -674,7 +674,7 @@ void ZLModSettingsInstall(void) {
     ZLMOD_LOG(@"settings hub class found=%d (%@)",
              settingsClassFound, gSettingsClass ? NSStringFromClass(gSettingsClass) : @"<nil>");
     if (!gSettingsClass) {
-        ZLModSetModuleStatus(@"Settings", ZLModModuleStatusPartial,
+        ZLModSetModuleStatus(@"Settings", ZLModModuleStatusNotInstalled,
                              @"Settings table view not found — universal shake gesture active");
         ZLMOD_LOG(@"settings table class not found — relying on universal shake gesture");
         return;
