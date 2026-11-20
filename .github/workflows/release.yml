@@ -1,0 +1,123 @@
+name: ZLMod Build & Release IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: "Tên bản Release (VD: ZLMod Build 10 — C-Bridge Edition)"
+        required: true
+        default: "ZLMod Build 10 — C-Bridge Edition"
+      release_tag:
+        description: "Git Tag cho bản phát hành (VD: build-10)"
+        required: true
+        default: "build-10"
+      release_description:
+        description: "Mô tả chi tiết nội dung phát hành (Hỗ trợ Markdown)"
+        required: false
+        type: string
+        default: |
+          ## 🚀 ZLMod — Tùy biến Native cho Zalo iOS (C-Bridge Edition)
+
+          ### ✨ Các tính năng mới:
+          - **C-Bridge & Local Server**: Kết nối thời gian thực qua kênh đôi native WebSocket (`NSURLSessionWebSocketTask`) tới Local Server (`zalo-meet-bot`).
+          - **CPairing**: Tự động nhận diện thiết bị và máy chủ trong cùng mạng nội bộ (Heartbeat 20s).
+          - **CSaving**: Chuyển tiếp và lưu trữ mọi loại tin nhắn (Text, Photo, Sticker, Voice, File, Undo) vào SQLite trên Local Server với cơ chế deduplication và bộ đệm an toàn.
+          - **CDeploy (Đồng bộ 2 chiều)**: Cho phép đẩy cấu hình lên server. Khi server gửi cấu hình mới xuống, app hiển thị hộp thoại xác nhận an toàn trước khi nạp vào máy.
+          - **Discord Webhook Relay**: Hỗ trợ chuyển tiếp cảnh báo và thông báo khẩn cấp tới kênh Discord đã cấu hình.
+
+          ---
+          ### 📦 Các bản IPA cung cấp sẵn bên dưới:
+          1. **Bản noappex (Khuyến nghị cho Sideloadly / SideStore / AltStore):** Đã gỡ bỏ toàn bộ extension phụ, chỉ dùng 1 App ID duy nhất, không lo lỗi giới hạn App ID trên tài khoản miễn phí.
+          2. **Bản đầy đủ (Full):** Dành cho TrollStore hoặc tài khoản Apple Developer trả phí.
+      decrypted_ipa_url:
+        description: "URL tải file IPA Zalo decrypted (để trống nếu chỉ xuất dylib)"
+        required: false
+        type: string
+        default: ""
+      target_bundle_id:
+        description: "Target Bundle ID (vn.com.vng.zingalo hoặc vn.com.vng.zingalo2)"
+        required: true
+        default: "vn.com.vng.zingalo2"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26 toolchain
+        run: |
+          echo "Available Xcode versions:"
+          ls /Applications | grep -i xcode || true
+          XC=$(ls -d /Applications/Xcode_26*.app /Applications/Xcode_16*.app /Applications/Xcode.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC"; fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Run portable contract & identity tests
+        run: |
+          python3 -m unittest discover -s Tests -p "test_*.py" -v
+          python3 Scripts/project_gate.py .
+
+      - name: Compile libZLMod.dylib
+        run: make
+
+      - name: Verify gates & security constraints
+        run: ./Scripts/gates.sh build/libZLMod.dylib
+
+      - name: Generate build metadata & reports
+        run: ./Scripts/report.sh build/libZLMod.dylib build
+
+      - name: Package dylib zip archive
+        run: |
+          cd build
+          cp ../README.md README.md 2>/dev/null || true
+          zip -9 "ZLMod-${{ inputs.release_tag }}.zip" \
+            libZLMod.dylib libZLMod.dylib.sha256 libZLMod.nm.txt libZLMod.otool-L.txt \
+            libZLMod.file.txt IMPLEMENTATION-REPORT.md COMPATIBILITY-REPORT.md README.md
+
+      - name: Repackage Decrypted IPAs (if IPA URL provided)
+        if: ${{ inputs.decrypted_ipa_url != '' }}
+        run: |
+          echo "[*] Downloading decrypted base IPA from ${{ inputs.decrypted_ipa_url }}..."
+          curl -fSL -o /tmp/base_decrypted.ipa "${{ inputs.decrypted_ipa_url }}"
+
+          echo "[*] Repackaging Full IPA (with all app extensions)..."
+          python3 Packaging/package_ipa.py \
+            --input /tmp/base_decrypted.ipa \
+            --output "build/Zalo-26.10.02-ZLMod-${{ inputs.release_tag }}-unsigned.ipa" \
+            --bundle-id "${{ inputs.target_bundle_id }}" \
+            --dylib build/libZLMod.dylib
+
+          echo "[*] Repackaging No-Appex IPA (stripped extensions for free Apple ID)..."
+          python3 Packaging/package_ipa.py \
+            --input /tmp/base_decrypted.ipa \
+            --output "build/Zalo-26.10.02-ZLMod-${{ inputs.release_tag }}-noappex-unsigned.ipa" \
+            --bundle-id "${{ inputs.target_bundle_id }}" \
+            --dylib build/libZLMod.dylib \
+            --no-appex
+
+          echo "[*] Generating SHA256 checksums for IPAs..."
+          cd build
+          shasum -a 256 *.ipa > ipa_checksums.sha256.txt
+          cat ipa_checksums.sha256.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_name }}
+          body: ${{ inputs.release_description }}
+          prerelease: false
+          draft: false
+          files: |
+            build/ZLMod-*.zip
+            build/libZLMod.dylib
+            build/libZLMod.dylib.sha256
+            build/*.ipa
+            build/*.sha256.txt
+            build/*-REPORT.md
