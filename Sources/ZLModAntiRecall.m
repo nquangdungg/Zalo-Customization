@@ -977,7 +977,7 @@ static BOOL ZLModIsChatRecalled(id chat) {
     return NO;
 }
 
-static void ZLModPresentRecalledMessageContent(id chat, id presenter) {
+static void __attribute__((unused)) ZLModPresentRecalledMessageContent(id chat, id presenter) {
     if (!chat) {
         ZLModShowToast(@"Không tìm thấy thông tin tin nhắn");
         return;

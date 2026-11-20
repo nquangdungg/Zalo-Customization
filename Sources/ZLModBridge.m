@@ -446,14 +446,16 @@ static const NSTimeInterval kZLModHeartbeatInterval = 20.0;
 
     __weak typeof(self) weakSelf = self;
     [self sendJSONDictionary:payload completion:^(BOOL success) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
         if (success) {
-            weakSelf.savedMessagesCount += batch.count;
+            strongSelf.savedMessagesCount += batch.count;
             ZLMOD_LOG(@"bridge: csaving dispatched %lu messages", (unsigned long)batch.count);
         } else {
             // Re-enqueue if send failed
-            os_unfair_lock_lock(&weakSelf->_lock);
-            [weakSelf.pendingMessages addObjectsFromArray:batch];
-            os_unfair_lock_unlock(&weakSelf->_lock);
+            os_unfair_lock_lock(&strongSelf->_lock);
+            [strongSelf.pendingMessages addObjectsFromArray:batch];
+            os_unfair_lock_unlock(&strongSelf->_lock);
         }
     }];
 }
