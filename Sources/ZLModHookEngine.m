@@ -12,7 +12,8 @@ BOOL ZLModIsAppRelatedClass(Class cls) {
     const char *image = class_getImageName(cls);
     if (!image) return NO;
     if (strstr(image, "/libZLMod.dylib") != NULL) return NO;
-    return strstr(image, "/Zalo.app/") != NULL;
+    if (strstr(image, ".app/") != NULL || strstr(image, ".APP/") != NULL) return YES;
+    return strstr(image, "/Zalo") != NULL;
 }
 
 BOOL ZLModClassHasInstanceMethod(Class cls, SEL sel) {

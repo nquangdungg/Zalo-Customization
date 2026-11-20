@@ -345,6 +345,9 @@ static void ZLModBoot(void) {
         ZLModRunInstaller(@"Bridge", ZLModBridgeInstall);
 
         ZLMOD_LOG(@"boot complete");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ZLModShowToast(@"✨ ZLMod Customize đã kích hoạt! Lắc máy hoặc vào Cài đặt để mở menu.");
+        });
     });
 }
 

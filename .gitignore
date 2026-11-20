@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 .superpowers/sdd/
 *.ipa
+!Decrypted/*.ipa
+!Base/*.ipa
 .DS_Store

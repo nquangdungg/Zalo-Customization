@@ -620,15 +620,63 @@ typedef void (*ZLModV2)(id, SEL, id, id);
 typedef NSInteger (*ZLModQ2)(id, SEL, id, NSInteger);
 typedef id (*ZLModObj2)(id, SEL, id, id);
 
+void ZLModPresentSettingsUniversal(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = ZLModActiveKeyWindow();
+        if (!win) return;
+        UIViewController *top = win.rootViewController;
+        if (!top) return;
+        while (top.presentedViewController) {
+            top = top.presentedViewController;
+        }
+        if ([top isKindOfClass:[ZLModSettingsViewController class]] ||
+            ([top isKindOfClass:[UINavigationController class]] &&
+             [[(UINavigationController *)top visibleViewController] isKindOfClass:[ZLModSettingsViewController class]])) {
+            return;
+        }
+        [ZLModSettingsViewController pushFrom:top];
+    });
+}
+
 void ZLModSettingsInstall(void) {
-    gSettingsClass = NSClassFromString(@"SettingUI40TableViewController");
+    // 1. Universal Shake Gesture: Shake device anywhere to present ZLMod Customize menu directly
+    Class winCls = [UIWindow class];
+    SEL motionSel = sel_registerName("motionEnded:withEvent:");
+    if (ZLModClassHasInstanceMethod(winCls, motionSel)) {
+        IMP motionOrig = class_getMethodImplementation(winCls, motionSel);
+        ZLModReplaceMethod(winCls, motionSel, 2, "v", ^(UIWindow *self, UIEventSubtype motion, UIEvent *event) {
+            ((void (*)(id, SEL, UIEventSubtype, id))motionOrig)(self, motionSel, motion, event);
+            if (motion == UIEventSubtypeMotionShake) {
+                ZLMOD_LOG(@"shake gesture detected — presenting ZLMod Customize");
+                ZLModPresentSettingsUniversal();
+            }
+        });
+    }
+
+    // 2. Discover Settings Hub Class with multi-version fallback
+    NSArray<NSString *> *candidates = @[
+        @"SettingUI40TableViewController",
+        @"SettingUITableViewController",
+        @"BasicSettingTableViewController",
+        @"ZaloSettingViewController",
+        @"SettingTableViewController"
+    ];
+    for (NSString *name in candidates) {
+        Class c = NSClassFromString(name);
+        if (c) {
+            gSettingsClass = c;
+            ZLMOD_LOG(@"settings hub class candidate '%@' matched", name);
+            break;
+        }
+    }
+
     BOOL settingsClassFound = gSettingsClass != Nil;
-    ZLMOD_LOG(@"settings hub class SettingUI40TableViewController found=%d (%@)",
+    ZLMOD_LOG(@"settings hub class found=%d (%@)",
              settingsClassFound, gSettingsClass ? NSStringFromClass(gSettingsClass) : @"<nil>");
     if (!gSettingsClass) {
-        ZLModSetModuleStatus(@"Settings", ZLModModuleStatusNotInstalled,
-                             @"SettingUI40TableViewController not found");
-        ZLMOD_LOG(@"settings hub class not found — settings integration idle");
+        ZLModSetModuleStatus(@"Settings", ZLModModuleStatusPartial,
+                             @"Settings table view not found — universal shake gesture active");
+        ZLMOD_LOG(@"settings table class not found — relying on universal shake gesture");
         return;
     }
 

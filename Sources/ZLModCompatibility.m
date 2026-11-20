@@ -18,6 +18,16 @@
             if ([bundleId isEqualToString:allowedBundle]) return YES;
         }
     }
+    // Dynamic fallback for sideloaded IPAs, remapped bundle IDs, or other compatible Zalo builds:
+    if (NSClassFromString(@"ZaloTabBarViewController") != Nil ||
+        NSClassFromString(@"SettingUI40TableViewController") != Nil ||
+        NSClassFromString(@"BasicSettingTableViewController") != Nil ||
+        NSClassFromString(@"ChatDataManager") != Nil ||
+        NSClassFromString(@"ChatMessage") != Nil ||
+        [bundleId.lowercaseString containsString:@"zalo"] ||
+        [bundleId.lowercaseString containsString:@"zing"]) {
+        return YES;
+    }
     return NO;
 }
 
@@ -37,6 +47,11 @@
     }
     if (versionBuildKnown) {
         return [NSString stringWithFormat:@"unsupported bundle %@", bundleId];
+    }
+    if (NSClassFromString(@"ZaloTabBarViewController") != Nil ||
+        NSClassFromString(@"SettingUI40TableViewController") != Nil ||
+        NSClassFromString(@"ChatDataManager") != Nil) {
+        return @"compatible host (runtime verified)";
     }
     return [NSString stringWithFormat:@"unsupported version/build %@/%@", version, build];
 }

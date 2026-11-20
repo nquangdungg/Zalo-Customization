@@ -30,14 +30,14 @@ on:
           1. **Bản noappex (Khuyến nghị cho Sideloadly / SideStore / AltStore):** Đã gỡ bỏ toàn bộ extension phụ, chỉ dùng 1 App ID duy nhất, không lo lỗi giới hạn App ID trên tài khoản miễn phí.
           2. **Bản đầy đủ (Full):** Dành cho TrollStore hoặc tài khoản Apple Developer trả phí.
       decrypted_ipa_url:
-        description: "URL tải file IPA Zalo decrypted (để trống nếu chỉ xuất dylib)"
+        description: "URL tải file IPA Zalo decrypted (nếu đã để file trong thư mục Decrypted/ thì có thể để trống)"
         required: false
         type: string
         default: ""
       target_bundle_id:
-        description: "Target Bundle ID (vn.com.vng.zingalo hoặc vn.com.vng.zingalo2)"
+        description: "Target Bundle ID ('auto' để giữ nguyên bundle ID gốc, hoặc vn.com.vng.zingalo2, vn.com.vng.zingalo)"
         required: true
-        default: "vn.com.vng.zingalo2"
+        default: "auto"
       is_prerelease:
         description: "Đánh dấu là bản Pre-release?"
         required: false
@@ -58,6 +58,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Ensure executable permissions
         run: |
@@ -99,34 +101,70 @@ jobs:
             libZLMod.dylib libZLMod.dylib.sha256 libZLMod.nm.txt libZLMod.otool-L.txt \
             libZLMod.file.txt IMPLEMENTATION-REPORT.md COMPATIBILITY-REPORT.md README.md
 
-      - name: Repackage Decrypted IPAs (if IPA URL provided)
-        if: ${{ inputs.decrypted_ipa_url != '' }}
+      - name: Detect & Repackage Decrypted IPAs
         run: |
-          echo "[*] Downloading decrypted base IPA from ${{ inputs.decrypted_ipa_url }}..."
-          curl -fSL -A "Mozilla/5.0" -o /tmp/base_decrypted.ipa "${{ inputs.decrypted_ipa_url }}"
+          DECRYPTED_IPA=""
 
-          if ! unzip -tq /tmp/base_decrypted.ipa > /dev/null 2>&1; then
-            echo "[-] ERROR: The downloaded file from '${{ inputs.decrypted_ipa_url }}' is not a valid IPA/ZIP archive!"
-            head -n 20 /tmp/base_decrypted.ipa
-            exit 1
+          # Priority 1: Direct URL download if provided in inputs
+          if [ -n "${{ inputs.decrypted_ipa_url }}" ]; then
+            echo "[*] Downloading decrypted base IPA from URL: ${{ inputs.decrypted_ipa_url }}..."
+            curl -fSL -A "Mozilla/5.0" -o /tmp/base_decrypted.ipa "${{ inputs.decrypted_ipa_url }}"
+            if unzip -tq /tmp/base_decrypted.ipa > /dev/null 2>&1; then
+              DECRYPTED_IPA="/tmp/base_decrypted.ipa"
+            else
+              echo "[-] WARNING: File downloaded from URL is not a valid ZIP/IPA archive. Checking local directories..."
+            fi
           fi
 
-          echo "[*] Repackaging Full IPA (with all app extensions)..."
+          # Priority 2: Check Decrypted/ directory in repository
+          if [ -z "$DECRYPTED_IPA" ] && compgen -G "Decrypted/*.ipa" > /dev/null; then
+            DECRYPTED_IPA=$(ls -1 Decrypted/*.ipa | head -n 1)
+            echo "[*] Found decrypted IPA in Decrypted/: $DECRYPTED_IPA"
+          fi
+
+          # Priority 3: Check Base/ directory
+          if [ -z "$DECRYPTED_IPA" ] && compgen -G "Base/*.ipa" > /dev/null; then
+            DECRYPTED_IPA=$(ls -1 Base/*.ipa | head -n 1)
+            echo "[*] Found decrypted IPA in Base/: $DECRYPTED_IPA"
+          fi
+
+          # Priority 4: Check root directory
+          if [ -z "$DECRYPTED_IPA" ] && compgen -G "*.ipa" > /dev/null; then
+            DECRYPTED_IPA=$(ls -1 *.ipa | head -n 1)
+            echo "[*] Found decrypted IPA in repo root: $DECRYPTED_IPA"
+          fi
+
+          if [ -z "$DECRYPTED_IPA" ]; then
+            echo "[*] No decrypted base IPA found in Decrypted/, Base/, root, or via URL."
+            echo "[*] Skipping IPA injection. Only libZLMod.dylib and reports will be published."
+            echo "[*] (To auto-build IPAs: commit your decrypted Zalo IPA to Decrypted/*.ipa or pass decrypted_ipa_url)."
+            exit 0
+          fi
+
+          echo "[+] Using decrypted IPA source: $DECRYPTED_IPA"
+          BUNDLE_ARG="${{ inputs.target_bundle_id }}"
+          if [ -z "$BUNDLE_ARG" ]; then
+            BUNDLE_ARG="auto"
+          fi
+
+          echo "[*] Repackaging Full IPA (with extensions)..."
           python3 Packaging/package_ipa.py \
-            --input /tmp/base_decrypted.ipa \
+            --input "$DECRYPTED_IPA" \
             --output "build/Zalo-ZLMod-${{ inputs.release_tag }}-full-unsigned.ipa" \
-            --bundle-id "${{ inputs.target_bundle_id }}" \
+            --bundle-id "$BUNDLE_ARG" \
+            --allow-custom-bundle-id \
             --dylib build/libZLMod.dylib
 
           echo "[*] Repackaging No-Appex IPA (stripped extensions for free Apple ID)..."
           python3 Packaging/package_ipa.py \
-            --input /tmp/base_decrypted.ipa \
+            --input "$DECRYPTED_IPA" \
             --output "build/Zalo-ZLMod-${{ inputs.release_tag }}-noappex-unsigned.ipa" \
-            --bundle-id "${{ inputs.target_bundle_id }}" \
+            --bundle-id "$BUNDLE_ARG" \
+            --allow-custom-bundle-id \
             --dylib build/libZLMod.dylib \
             --no-appex
 
-          echo "[*] Generating SHA256 checksums for IPAs..."
+          echo "[*] Generating SHA256 checksums for repacked IPAs..."
           cd build
           shasum -a 256 *.ipa > ipa_checksums.sha256.txt || true
           cat ipa_checksums.sha256.txt || true

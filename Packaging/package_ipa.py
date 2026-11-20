@@ -30,7 +30,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from macho_injector import get_load_dylibs, inject_load_dylib
+from macho_injector import get_load_dylibs, inject_load_dylib, inject_rpath
 
 COMPATIBILITY_MANIFEST = PROJECT_ROOT / "Resources" / "compatibility.json"
 DEFAULT_DYLIB = PROJECT_ROOT / "build" / "libZLMod.dylib"
@@ -113,13 +113,22 @@ def repackage(
     display_name: str = "Zalo ZLMod",
     work_dir: Path | None = None,
     no_appex: bool = False,
+    allow_custom_bundle_id: bool = False,
 ) -> Path:
-    validate_bundle_id(bundle_id)
+    target_bundle_override = None
+    if bundle_id in ("auto", "preserve", ""):
+        target_bundle_override = None
+    elif not allow_custom_bundle_id:
+        validate_bundle_id(bundle_id)
+        target_bundle_override = bundle_id
+    else:
+        target_bundle_override = bundle_id
+
     if mod_dylib.name != "libZLMod.dylib":
         raise ValueError("dylib must be named libZLMod.dylib")
     print("\n================================================================================")
     print(f"[*] Repackaging ZLMod IPA: {input_ipa.name} -> {output_ipa.name}")
-    print(f"    Target Bundle ID:    {bundle_id}")
+    print(f"    Target Bundle ID:    {target_bundle_override or 'preserve original'}")
     print(f"    Display Name:        {display_name}")
     print(f"    Injected Mod Dylib:  {mod_dylib}")
     print("================================================================================")
@@ -165,12 +174,13 @@ def repackage(
         orig_bundle_id = main_plist.get("CFBundleIdentifier", "vn.com.vng.zingalo")
         orig_display_name = main_plist.get("CFBundleDisplayName", "Zalo")
         exec_name = main_plist.get("CFBundleExecutable", "Zalo")
+        final_bundle_id = target_bundle_override if target_bundle_override else orig_bundle_id
         print(f"[*] Original Bundle ID:   {orig_bundle_id}")
         print(f"[*] Original Display Name: {orig_display_name}")
 
-        main_plist["CFBundleIdentifier"] = bundle_id
+        main_plist["CFBundleIdentifier"] = final_bundle_id
         main_plist["CFBundleDisplayName"] = display_name
-        print(f"[+] Updated Bundle ID:    {bundle_id}")
+        print(f"[+] Updated Bundle ID:    {final_bundle_id}")
         print(f"[+] Updated Display Name: {display_name}")
 
         with open(main_plist_path, "wb") as f:
@@ -192,13 +202,32 @@ def repackage(
                     ext_plist = plistlib.load(f)
                 ext_id = ext_plist.get("CFBundleIdentifier", "")
                 try:
-                    new_ext_id = remap_child_bundle_id(ext_id, orig_bundle_id, bundle_id)
+                    new_ext_id = remap_child_bundle_id(ext_id, orig_bundle_id, final_bundle_id)
                     print(f" [+] Extension {ext_plist_path.parent.name}: {ext_id} -> {new_ext_id}")
                     ext_plist["CFBundleIdentifier"] = new_ext_id
                     with open(ext_plist_path, "wb") as f:
                         plistlib.dump(ext_plist, f)
                 except ValueError:
                     print(f" [!] Extension {ext_plist_path.parent.name} has non-matching prefix: {ext_id}")
+
+            # Strip any extension that is still encrypted (cryptid != 0) to avoid sideload/dyld crashes
+            if plugins_dir.exists():
+                for ext_dir in list(plugins_dir.glob("*.appex")):
+                    ext_plist = ext_dir / "Info.plist"
+                    if ext_plist.exists():
+                        try:
+                            with open(ext_plist, "rb") as epf:
+                                ep_data = plistlib.load(epf)
+                            ext_exec = ep_data.get("CFBundleExecutable")
+                            if ext_exec:
+                                ext_bin = ext_dir / ext_exec
+                                if ext_bin.exists():
+                                    with open(ext_bin, "rb") as ebf:
+                                        if check_macho_cryptid(ebf.read()) != 0:
+                                            print(f" [!] Extension {ext_dir.name} is encrypted (cryptid != 0). Stripping for sideloading safety...")
+                                            shutil.rmtree(ext_dir)
+                        except Exception as e:
+                            print(f" [-] Could not audit extension {ext_dir.name}: {e}")
 
         # 4. Copy Mod Dylib into Frameworks
         frameworks_dir = app_dir / "Frameworks"
@@ -207,18 +236,30 @@ def repackage(
         shutil.copy2(mod_dylib, dest_dylib)
         print(f"[+] Copied dylib to: {dest_dylib} ({dest_dylib.stat().st_size:,} bytes)")
 
-        # 5. Inject LC_LOAD_DYLIB into Main Executable
+        # 5. Inject LC_RPATH & LC_LOAD_DYLIB into Main Executable
         main_binary = app_dir / exec_name
         if not main_binary.exists():
             raise RuntimeError(f"Main executable missing: {main_binary}")
         with open(main_binary, "rb") as f:
             binary_bytes = f.read()
 
+        binary_bytes = inject_rpath(binary_bytes, "@executable_path/Frameworks")
         patched_binary_bytes = inject_load_dylib(binary_bytes, ZLMOD_LOAD_COMMAND)
 
         with open(main_binary, "wb") as f:
             f.write(patched_binary_bytes)
         print(f"[+] Injected load command '{ZLMOD_LOAD_COMMAND}' into {main_binary}")
+
+        # Ad-hoc codesign when codesign tool is present
+        codesign_bin = shutil.which("codesign")
+        if codesign_bin:
+            print("[*] Performing ad-hoc codesigning with 'codesign --force --sign -'...")
+            try:
+                import subprocess
+                subprocess.run([codesign_bin, "--force", "--sign", "-", "--timestamp=none", str(dest_dylib)], check=False, capture_output=True)
+                subprocess.run([codesign_bin, "--force", "--sign", "-", "--timestamp=none", str(main_binary)], check=False, capture_output=True)
+            except Exception as e:
+                print(f" [-] Ad-hoc codesign skipped: {e}")
 
         # 6. Repack into new IPA preserving POSIX permissions
         output_ipa.parent.mkdir(parents=True, exist_ok=True)
@@ -256,7 +297,7 @@ def repackage(
     print("\n================================================================================")
     print("[*] Validating Preflight Forensics on Repacked IPA...")
     print("================================================================================")
-    validate_ipa(output_ipa, mod_dylib.name, bundle_id, display_name)
+    validate_ipa(output_ipa, mod_dylib.name, final_bundle_id, display_name)
 
     return output_ipa
 
@@ -330,10 +371,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Package a decrypted Zalo IPA with ZLMod")
     parser.add_argument("--input", required=True, help="Input decrypted IPA")
     parser.add_argument("--output", required=True, help="Output unsigned IPA")
-    parser.add_argument("--bundle-id", required=True, help="Target bundle identifier from compatibility.json")
+    parser.add_argument("--bundle-id", required=True, help="Target bundle identifier ('auto', 'preserve', or from compatibility.json)")
     parser.add_argument("--display-name", default="Zalo ZLMod", help="Target display name")
     parser.add_argument("--dylib", default=str(DEFAULT_DYLIB), help="Path to libZLMod.dylib")
     parser.add_argument("--no-appex", action="store_true", help="Strip app extensions for free Apple ID (single App ID)")
+    parser.add_argument("--allow-custom-bundle-id", action="store_true", help="Allow arbitrary custom bundle identifiers")
     return parser
 
 
@@ -343,7 +385,15 @@ def main(argv=None) -> int:
     output_path = Path(args.output).resolve()
     dylib_path = Path(args.dylib).resolve()
 
-    repackage(input_path, output_path, dylib_path, args.bundle_id, args.display_name, no_appex=args.no_appex)
+    repackage(
+        input_path,
+        output_path,
+        dylib_path,
+        args.bundle_id,
+        args.display_name,
+        no_appex=args.no_appex,
+        allow_custom_bundle_id=args.allow_custom_bundle_id,
+    )
     return 0
 
 
