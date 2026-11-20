@@ -38,6 +38,16 @@ on:
         description: "Target Bundle ID (vn.com.vng.zingalo hoặc vn.com.vng.zingalo2)"
         required: true
         default: "vn.com.vng.zingalo2"
+      is_prerelease:
+        description: "Đánh dấu là bản Pre-release?"
+        required: false
+        type: boolean
+        default: false
+      is_draft:
+        description: "Tạo bản nháp (Draft Release)?"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -49,13 +59,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select Xcode 26 toolchain
+      - name: Ensure executable permissions
+        run: |
+          chmod +x Scripts/*.sh Scripts/*.py Packaging/*.py || true
+
+      - name: Select Xcode toolchain
         run: |
           echo "Available Xcode versions:"
           ls /Applications | grep -i xcode || true
-          XC=$(ls -d /Applications/Xcode_26*.app /Applications/Xcode_16*.app /Applications/Xcode.app 2>/dev/null | sort -V | tail -1)
-          if [ -n "$XC" ]; then sudo xcode-select -s "$XC"; fi
-          xcodebuild -version
+          XC=$(ls -d /Applications/Xcode_26*.app /Applications/Xcode_16*.app /Applications/Xcode_15*.app /Applications/Xcode.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XC" ]; then
+            echo "Selecting Xcode: $XC"
+            sudo xcode-select -s "$XC"
+          fi
+          xcodebuild -version || true
           xcrun --sdk iphoneos --show-sdk-path
 
       - name: Run portable contract & identity tests
@@ -67,10 +84,12 @@ jobs:
         run: make
 
       - name: Verify gates & security constraints
-        run: ./Scripts/gates.sh build/libZLMod.dylib
+        run: bash Scripts/gates.sh build/libZLMod.dylib
 
       - name: Generate build metadata & reports
-        run: ./Scripts/report.sh build/libZLMod.dylib build
+        env:
+          ZLMOD_VERSION: ${{ inputs.release_tag }}
+        run: bash Scripts/report.sh build/libZLMod.dylib build
 
       - name: Package dylib zip archive
         run: |
@@ -84,27 +103,45 @@ jobs:
         if: ${{ inputs.decrypted_ipa_url != '' }}
         run: |
           echo "[*] Downloading decrypted base IPA from ${{ inputs.decrypted_ipa_url }}..."
-          curl -fSL -o /tmp/base_decrypted.ipa "${{ inputs.decrypted_ipa_url }}"
+          curl -fSL -A "Mozilla/5.0" -o /tmp/base_decrypted.ipa "${{ inputs.decrypted_ipa_url }}"
+
+          if ! unzip -tq /tmp/base_decrypted.ipa > /dev/null 2>&1; then
+            echo "[-] ERROR: The downloaded file from '${{ inputs.decrypted_ipa_url }}' is not a valid IPA/ZIP archive!"
+            head -n 20 /tmp/base_decrypted.ipa
+            exit 1
+          fi
 
           echo "[*] Repackaging Full IPA (with all app extensions)..."
           python3 Packaging/package_ipa.py \
             --input /tmp/base_decrypted.ipa \
-            --output "build/Zalo-26.10.02-ZLMod-${{ inputs.release_tag }}-unsigned.ipa" \
+            --output "build/Zalo-ZLMod-${{ inputs.release_tag }}-full-unsigned.ipa" \
             --bundle-id "${{ inputs.target_bundle_id }}" \
             --dylib build/libZLMod.dylib
 
           echo "[*] Repackaging No-Appex IPA (stripped extensions for free Apple ID)..."
           python3 Packaging/package_ipa.py \
             --input /tmp/base_decrypted.ipa \
-            --output "build/Zalo-26.10.02-ZLMod-${{ inputs.release_tag }}-noappex-unsigned.ipa" \
+            --output "build/Zalo-ZLMod-${{ inputs.release_tag }}-noappex-unsigned.ipa" \
             --bundle-id "${{ inputs.target_bundle_id }}" \
             --dylib build/libZLMod.dylib \
             --no-appex
 
           echo "[*] Generating SHA256 checksums for IPAs..."
           cd build
-          shasum -a 256 *.ipa > ipa_checksums.sha256.txt
-          cat ipa_checksums.sha256.txt
+          shasum -a 256 *.ipa > ipa_checksums.sha256.txt || true
+          cat ipa_checksums.sha256.txt || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZLMod-${{ inputs.release_tag }}-artifacts
+          path: |
+            build/libZLMod.dylib
+            build/*.sha256
+            build/*-REPORT.md
+            build/ZLMod-*.zip
+            build/*.ipa
+            build/*.sha256.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -112,8 +149,9 @@ jobs:
           tag_name: ${{ inputs.release_tag }}
           name: ${{ inputs.release_name }}
           body: ${{ inputs.release_description }}
-          prerelease: false
-          draft: false
+          prerelease: ${{ inputs.is_prerelease }}
+          draft: ${{ inputs.is_draft }}
+          fail_on_unmatched_files: false
           files: |
             build/ZLMod-*.zip
             build/libZLMod.dylib

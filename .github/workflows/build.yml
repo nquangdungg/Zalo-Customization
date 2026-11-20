@@ -15,15 +15,23 @@ jobs:
     env:
       ZLMOD_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Select Xcode 26 toolchain
+      - name: Ensure executable permissions
         run: |
-          echo "Available Xcode:"
+          chmod +x Scripts/*.sh Scripts/*.py Packaging/*.py || true
+
+      - name: Select Xcode toolchain
+        run: |
+          echo "Available Xcode versions:"
           ls /Applications | grep -i xcode || true
-          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
-          if [ -n "$XC" ]; then sudo xcode-select -s "$XC"; fi
-          xcodebuild -version
+          XC=$(ls -d /Applications/Xcode_26*.app /Applications/Xcode_16*.app /Applications/Xcode_15*.app /Applications/Xcode.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XC" ]; then
+            echo "Selecting Xcode: $XC"
+            sudo xcode-select -s "$XC"
+          fi
+          xcodebuild -version || true
           xcrun --sdk iphoneos --show-sdk-path
 
       - name: Portable contract & identity tests
@@ -35,10 +43,10 @@ jobs:
         run: make
 
       - name: Verification gates
-        run: ./Scripts/gates.sh build/libZLMod.dylib
+        run: bash Scripts/gates.sh build/libZLMod.dylib
 
       - name: Metadata + reports
-        run: ./Scripts/report.sh build/libZLMod.dylib build
+        run: bash Scripts/report.sh build/libZLMod.dylib build
 
       - name: Package artifacts
         run: |
@@ -64,6 +72,7 @@ jobs:
         with:
           prerelease: true
           name: ZLMod ${{ github.ref_name }}
+          fail_on_unmatched_files: false
           body: |
             ZLMod ${{ github.ref_name }} — Zalo native customization dylib.
 
@@ -71,7 +80,7 @@ jobs:
             - Modules: ZLModCore, ZLModCompatibility, ZLModPreferences, ZLModHookEngine,
               ZLModCryptoStore, ZLModPolicyStore, ZLModURIFilter, ZLModPrivacy,
               ZLModConversationMenu, ZLModAntiRecall, ZLModUtilities, ZLModTheme,
-              ZLModAds, ZLModFeatures, ZLModSettings, ZLModUI, ZLModGlass
+              ZLModAds, ZLModFeatures, ZLModSettings, ZLModUI, ZLModGlass, ZLModBridge
             - Verification gates passed: arm64, deps clean (no substrate),
               install_name, minos 15.1, UIGlassEffect runtime-guarded, codesigned
             - See IMPLEMENTATION-REPORT.md and COMPATIBILITY-REPORT.md

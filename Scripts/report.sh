@@ -49,6 +49,7 @@ cat > "$OUTDIR/IMPLEMENTATION-REPORT.md" <<EOF
 | ZLModSettings | ZLMod Customize row (cloned native cell) + navigation |
 | ZLModUI | full settings dashboard + 6 child management/diagnostic controllers |
 | ZLModGlass | tab bar glass material overlay (REAL_GLASS / BLUR tier) |
+| ZLModBridge | native WebSocket pairing (CPairing), message relay & storage buffer (CSaving), two-way settings sync with user confirmation (CDeploy), Discord webhook alerts |
 
 ## Exported interface
 

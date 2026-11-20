@@ -38,7 +38,7 @@ $(TARGET): $(SOURCES) $(SRC_DIR)/ZLMod.h $(COMPAT_HEADER)
 	@echo "built $(TARGET)"
 
 gates: $(TARGET)
-	./Scripts/gates.sh
+	bash ./Scripts/gates.sh $(TARGET)
 
 clean:
 	rm -rf $(BUILD_DIR)
