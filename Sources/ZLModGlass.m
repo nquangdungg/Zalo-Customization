@@ -1,25 +1,20 @@
 // language: Objective-C, file: ZLModGlass.m, target: iOS 15.1+ (Zalo 26.10.02 & 26.11.01, arm64)
-// Glass-style tab bar material.
+// Blur-style tab bar material (MODULE 09).
 //
 // Zalo opts out of the iOS 26 redesign (UIDesignRequiresCompatibility=YES), so the system
-// tab bar cannot adopt Liquid Glass. Field testing showed that embedding a UIGlassEffect
-// view inside the compat-mode UITabBar freezes the app, so ZLMod now uses only a
-// UIVisualEffectView backed by systemUltraThinMaterial. The overlay is attached once to the
-// real UITabBar, ignores touches, never alters navigation/safe areas/layout and the tab
-// bar's original appearance is restored exactly when the feature is switched off.
+// tab bar cannot adopt Liquid Glass. Instead, ZLMod applies UIBlurEffectStyleSystemUltraThinMaterial
+// through ZLModAppearanceCoordinator so Theme presets and Tab Bar blur compose cleanly on top
+// of a single captured baseline and restore cleanly when switched off.
 
 #import "ZLMod.h"
 
 typedef void (*ZLModV1Bool)(id, SEL, BOOL);
 
 static __weak id gTabBarController = nil;
-static __weak UITabBar *gStyledBar = nil;
-static UITabBarAppearance *gSavedStandard = nil;
-static UITabBarAppearance *gSavedScrollEdge = nil;
-static BOOL gSavedAppearanceValid = NO;
+static BOOL gGlassInstalled = NO;
 
 NSString *ZLModGlassMaterialDescription(void) {
-    return @"System blur material (UIBlurEffect)";
+    return @"System ultra-thin blur material (UIBlurEffect)";
 }
 
 static UITabBar *ZLModFindUITabBar(UIView *root, NSUInteger depth) {
@@ -39,67 +34,62 @@ static UITabBar *ZLModResolveTabBar(UIViewController *controller) {
     return ZLModFindUITabBar(controller.view, 0);
 }
 
-static void ZLModGlassRemove(void) {
-    UITabBar *bar = gStyledBar;
-    if (bar && gSavedAppearanceValid) {
-        bar.standardAppearance = gSavedStandard ?: [[UITabBarAppearance alloc] init];
-        bar.scrollEdgeAppearance = gSavedScrollEdge;
-        ZLMOD_LOG(@"glass appearance restored");
+static void ZLModRegisterCurrentTabBarIfAvailable(void) {
+    id vc = gTabBarController;
+    if (![vc isKindOfClass:[UIViewController class]]) return;
+    UITabBar *bar = ZLModResolveTabBar((UIViewController *)vc);
+    if (bar) {
+        [[ZLModAppearanceCoordinator shared] registerTabBar:bar];
     }
-    gSavedStandard = nil;
-    gSavedScrollEdge = nil;
-    gSavedAppearanceValid = NO;
-    gStyledBar = nil;
 }
 
-static BOOL gApplying = NO;
+static void ZLModGlassRemove(void) {
+    ZLModRegisterCurrentTabBarIfAvailable();
+    [[ZLModAppearanceCoordinator shared] reapplyAllAppearance];
+    ZLMOD_LOG(@"glass appearance removed via coordinator");
+}
 
 static void ZLModGlassApply(void) {
-    if (gApplying) return;
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ ZLModGlassApply(); });
-        return;
-    }
-    if (![[ZLModPreferences shared] boolForKey:kZLModGlassTabBar]) return;
-    gApplying = YES;
-    @try {
-        id vc = gTabBarController;
-        if (![vc isKindOfClass:[UIViewController class]]) return;
-        UITabBar *bar = ZLModResolveTabBar((UIViewController *)vc);
-        if (!bar) return;
-
-        if (gStyledBar == bar && gSavedAppearanceValid) {
-            return;
-        }
-
-        // Keep the original appearance so switching the feature off restores it exactly.
-        gSavedStandard = [bar.standardAppearance copy];
-        gSavedScrollEdge = [bar.scrollEdgeAppearance copy];
-        gSavedAppearanceValid = YES;
-        gStyledBar = bar;
-
-        UITabBarAppearance *glassApp = [bar.standardAppearance copy] ?: [[UITabBarAppearance alloc] init];
-        [glassApp configureWithDefaultBackground];
-        glassApp.backgroundEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
-        glassApp.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-        bar.standardAppearance = glassApp;
-        bar.scrollEdgeAppearance = glassApp;
-        ZLMOD_LOG(@"glass appearance applied natively — %@", ZLModGlassMaterialDescription());
-    } @finally {
-        gApplying = NO;
-    }
+    ZLModRunOnMainThread(^{
+        ZLModRegisterCurrentTabBarIfAvailable();
+        if (![[ZLModPreferences shared] boolForKey:kZLModGlassTabBar]) return;
+        [[ZLModAppearanceCoordinator shared] reapplyAllAppearance];
+        ZLMOD_LOG(@"glass appearance applied via coordinator — %@", ZLModGlassMaterialDescription());
+    });
 }
 
 static void ZLModGlassRefreshForCurrentUI(void) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ ZLModGlassRefreshForCurrentUI(); });
-        return;
+    ZLModRunOnMainThread(^{
+        if (![[ZLModPreferences shared] boolForKey:kZLModGlassTabBar]) {
+            ZLModGlassRemove();
+            return;
+        }
+        ZLModGlassApply();
+    });
+}
+
+static BOOL ZLModNoteMentionsGlass(NSNotification *note) {
+    id obj = note.object;
+    if ([obj isKindOfClass:[NSString class]]) {
+        NSString *key = (NSString *)obj;
+        if ([key isEqualToString:kZLModGlassTabBar] || [key isEqualToString:@"*"]) return YES;
     }
-    if (![[ZLModPreferences shared] boolForKey:kZLModGlassTabBar]) { ZLModGlassRemove(); return; }
-    ZLModGlassApply();
+    NSArray *changed = note.userInfo[ZLModPrefsChangedKeysUserInfoKey];
+    if ([changed isKindOfClass:[NSArray class]]) {
+        for (id item in changed) {
+            if ([item isKindOfClass:[NSString class]]) {
+                NSString *k = (NSString *)item;
+                if ([k isEqualToString:kZLModGlassTabBar] || [k isEqualToString:@"*"]) return YES;
+            }
+        }
+    }
+    return NO;
 }
 
 void ZLModGlassInstall(void) {
+    if (gGlassInstalled) return;
+    gGlassInstalled = YES;
+
     Class tabCls = NSClassFromString(@"ZaloTabBarViewController");
     if (!tabCls) {
         ZLModSetModuleStatus(@"Glass", ZLModModuleStatusNotInstalled,
@@ -114,15 +104,21 @@ void ZLModGlassInstall(void) {
         ((ZLModV1Bool)appearOrig)(self, appearSel, animated);
         gTabBarController = self;
         // Defer one runloop turn so UIKit finishes its own layout pass first.
-        dispatch_async(dispatch_get_main_queue(), ^{ ZLModGlassApply(); });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ZLModRegisterCurrentTabBarIfAvailable();
+            if ([[ZLModPreferences shared] boolForKey:kZLModGlassTabBar]) {
+                ZLModGlassApply();
+            } else {
+                [[ZLModAppearanceCoordinator shared] reapplyAllAppearance];
+            }
+        });
     });
 
     [[NSNotificationCenter defaultCenter] addObserverForName:ZLModPrefsDidChangeNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
-        if ([note.object isEqualToString:kZLModGlassTabBar] ||
-            [note.object isEqualToString:@"*"]) {
+        if (ZLModNoteMentionsGlass(note)) {
             ZLModGlassRefreshForCurrentUI();
         }
     }];

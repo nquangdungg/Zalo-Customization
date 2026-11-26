@@ -1,6 +1,7 @@
 // language: Objective-C, file: ZLModPolicyStore.m, target: iOS 15.1+ (Zalo 26.10.02 & 26.11.01, arm64)
-// Active chat context tracker and per-conversation policy persistence
-// scoped by verified accountScope (fail-closed when unidentified).
+// Active chat context stack (LIFO safe across nested chat pushes) and account-scoped
+// per-conversation policy persistence (v3 with encrypted display titles, v2 read-compatible,
+// non-blocking async disk writes outside locks, fail-closed when account unidentified).
 
 #import "ZLMod.h"
 #import <os/lock.h>
@@ -8,12 +9,28 @@
 NSString *const ZLModConversationPolicyDidChangeNotification = @"ZLModConversationPolicyDidChangeNotification";
 NSString *const ZLModPolicyThreadIdKey = @"threadId";
 
-#pragma mark - ZLModPrivacyContext
+#pragma mark - ZLModPrivacyContext (LIFO Stack)
+
+@interface ZLModChatContextEntry : NSObject
+@property (nonatomic, weak) id controller;
+@property (nonatomic, copy) NSString *threadId;
+@property (nonatomic, copy) NSString *convType;
+@end
+
+@implementation ZLModChatContextEntry
+@end
 
 static os_unfair_lock gPrivacyCtxLock = OS_UNFAIR_LOCK_INIT;
-static __weak id gActiveChatController = nil;
-static NSString *gActiveThreadId = nil;
-static NSString *gActiveConvType = nil;
+static NSMutableArray<ZLModChatContextEntry *> *gChatContextStack = nil;
+
+static void ZLModPruneDeadContextLocked(void) {
+    if (!gChatContextStack) return;
+    for (NSInteger i = (NSInteger)gChatContextStack.count - 1; i >= 0; i--) {
+        if (gChatContextStack[(NSUInteger)i].controller == nil) {
+            [gChatContextStack removeObjectAtIndex:(NSUInteger)i];
+        }
+    }
+}
 
 @implementation ZLModPrivacyContext
 
@@ -25,49 +42,66 @@ static NSString *gActiveConvType = nil;
     NSString *cleanType = [convType isEqualToString:@"group"] ? @"group" : @"single";
 
     os_unfair_lock_lock(&gPrivacyCtxLock);
-    gActiveChatController = controller;
-    gActiveThreadId = cleanThread;
-    gActiveConvType = cleanType;
+    if (!gChatContextStack) {
+        gChatContextStack = [NSMutableArray array];
+    }
+    ZLModPruneDeadContextLocked();
+    // Remove any previous entry for the same controller before pushing to top.
+    for (NSInteger i = (NSInteger)gChatContextStack.count - 1; i >= 0; i--) {
+        if (gChatContextStack[(NSUInteger)i].controller == controller) {
+            [gChatContextStack removeObjectAtIndex:(NSUInteger)i];
+        }
+    }
+    ZLModChatContextEntry *entry = [[ZLModChatContextEntry alloc] init];
+    entry.controller = controller;
+    entry.threadId = cleanThread;
+    entry.convType = cleanType;
+    [gChatContextStack addObject:entry];
     os_unfair_lock_unlock(&gPrivacyCtxLock);
 }
 
 + (void)noteChatControllerWillDisappear:(id)controller {
     os_unfair_lock_lock(&gPrivacyCtxLock);
-    id current = gActiveChatController;
-    if (!controller || current == nil || current == controller) {
-        gActiveChatController = nil;
-        gActiveThreadId = nil;
-        gActiveConvType = nil;
+    ZLModPruneDeadContextLocked();
+    if (!controller) {
+        [gChatContextStack removeAllObjects];
+    } else {
+        for (NSInteger i = (NSInteger)gChatContextStack.count - 1; i >= 0; i--) {
+            if (gChatContextStack[(NSUInteger)i].controller == controller) {
+                [gChatContextStack removeObjectAtIndex:(NSUInteger)i];
+            }
+        }
     }
     os_unfair_lock_unlock(&gPrivacyCtxLock);
 }
 
 + (id)activeChatController {
     os_unfair_lock_lock(&gPrivacyCtxLock);
-    id controller = gActiveChatController;
+    ZLModPruneDeadContextLocked();
+    id controller = gChatContextStack.lastObject.controller;
     os_unfair_lock_unlock(&gPrivacyCtxLock);
     return controller;
 }
 
 + (NSString *)activeThreadId {
     os_unfair_lock_lock(&gPrivacyCtxLock);
-    NSString *tid = gActiveThreadId;
+    ZLModPruneDeadContextLocked();
+    NSString *tid = gChatContextStack.lastObject.threadId;
     os_unfair_lock_unlock(&gPrivacyCtxLock);
     return tid;
 }
 
 + (NSString *)activeConversationType {
     os_unfair_lock_lock(&gPrivacyCtxLock);
-    NSString *ct = gActiveConvType;
+    ZLModPruneDeadContextLocked();
+    NSString *ct = gChatContextStack.lastObject.convType;
     os_unfair_lock_unlock(&gPrivacyCtxLock);
     return ct;
 }
 
 + (void)clearActiveContext {
     os_unfair_lock_lock(&gPrivacyCtxLock);
-    gActiveChatController = nil;
-    gActiveThreadId = nil;
-    gActiveConvType = nil;
+    [gChatContextStack removeAllObjects];
     os_unfair_lock_unlock(&gPrivacyCtxLock);
 }
 
@@ -131,6 +165,14 @@ static NSString *gActiveConvType = nil;
     return [NSString stringWithFormat:@"%@:%@:%@", accountScope, [self normalizedType:convType], threadId];
 }
 
++ (NSData *)titleMetadataForAccountScope:(NSString *)scope
+                        conversationType:(NSString *)convType
+                                threadId:(NSString *)threadId {
+    NSString *bound = [NSString stringWithFormat:@"ZLModPolicyTitle.v3|%@|%@|%@",
+                       scope ?: @"", [self normalizedType:convType], threadId ?: @""];
+    return [bound dataUsingEncoding:NSUTF8StringEncoding];
+}
+
 - (void)loadFromDiskLocked {
     if (![[NSFileManager defaultManager] fileExistsAtPath:self.storagePath]) return;
     @try {
@@ -143,7 +185,8 @@ static NSString *gActiveConvType = nil;
         if (![plist isKindOfClass:[NSDictionary class]]) return;
         NSNumber *version = plist[@"version"];
         NSDictionary *rawPolicies = plist[@"policies"];
-        if (![version isKindOfClass:[NSNumber class]] || version.integerValue != 2 ||
+        if (![version isKindOfClass:[NSNumber class]] ||
+            (version.integerValue != 2 && version.integerValue != 3) ||
             ![rawPolicies isKindOfClass:[NSDictionary class]]) {
             return;
         }
@@ -157,29 +200,15 @@ static NSString *gActiveConvType = nil;
     }
 }
 
-- (BOOL)persistLocked {
+- (NSDictionary *)immutableSnapshotLocked {
     NSMutableDictionary *serializedPolicies = [NSMutableDictionary dictionaryWithCapacity:self.policies.count];
     [self.policies enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSMutableDictionary *val, __unused BOOL *stop) {
         serializedPolicies[key] = [val copy];
     }];
-    NSDictionary *root = @{
-        @"version": @2,
-        @"policies": serializedPolicies
+    return @{
+        @"version": @3,
+        @"policies": [serializedPolicies copy]
     };
-    NSError *error = nil;
-    NSData *data = [NSPropertyListSerialization dataWithPropertyList:root
-                                                              format:NSPropertyListBinaryFormat_v1_0
-                                                             options:0
-                                                               error:&error];
-    if (!data || error) {
-        ZLMOD_LOG(@"policy store: serialization failed (%@)", error.localizedDescription ?: @"unknown");
-        return NO;
-    }
-    BOOL written = [data writeToFile:self.storagePath options:NSDataWritingAtomic error:&error];
-    if (!written) {
-        ZLMOD_LOG(@"policy store: atomic write failed (%@)", error.localizedDescription ?: @"unknown");
-    }
-    return written;
 }
 
 - (NSMutableDictionary *)entryLockedForAccountScope:(NSString *)accountScope
@@ -198,10 +227,9 @@ static NSString *gActiveConvType = nil;
     NSString *key = [[self class] compoundKeyForAccountScope:accountScope conversationType:convType threadId:threadId];
     if (!key) return NO;
 
-    BOOL saved = NO;
+    NSDictionary *snapshot = nil;
     os_unfair_lock_lock(&_lock);
-    NSMutableDictionary *previousEntry = self.policies[key] ? [self.policies[key] mutableCopy] : nil;
-    NSMutableDictionary *entry = previousEntry ? [previousEntry mutableCopy] : [NSMutableDictionary dictionary];
+    NSMutableDictionary *entry = self.policies[key] ? [self.policies[key] mutableCopy] : [NSMutableDictionary dictionary];
     entry[field] = value;
     entry[@"convType"] = [[self class] normalizedType:convType];
     entry[@"updatedAt"] = @([[NSDate date] timeIntervalSince1970]);
@@ -214,26 +242,45 @@ static NSString *gActiveConvType = nil;
     } else {
         self.policies[key] = entry;
     }
+    snapshot = [self immutableSnapshotLocked];
+    os_unfair_lock_unlock(&_lock);
 
-    saved = [self persistLocked];
-    if (!saved) {
-        if (previousEntry) {
-            self.policies[key] = previousEntry;
-        } else {
-            [self.policies removeObjectForKey:key];
-        }
+    // Non-blocking atomic disk write outside lock.
+    ZLModWritePropertyListAsync(snapshot, self.storagePath, nil);
+    [self postPolicyDidChangeForThreadId:threadId];
+    return YES;
+}
+
+- (void)updateDisplayTitle:(NSString *)displayTitle
+           forAccountScope:(NSString *)accountScope
+          conversationType:(NSString *)convType
+                  threadId:(NSString *)threadId {
+    if (displayTitle.length == 0 || accountScope.length == 0 || threadId.length == 0) return;
+    if ([displayTitle isEqualToString:@"Cuộc trò chuyện"]) return;
+    NSString *key = [[self class] compoundKeyForAccountScope:accountScope conversationType:convType threadId:threadId];
+    if (!key) return;
+
+    NSData *meta = [[self class] titleMetadataForAccountScope:accountScope conversationType:convType threadId:threadId];
+    NSData *cipher = [[ZLModCryptoBox shared] encryptString:displayTitle metadata:meta];
+    if (!cipher) return;
+
+    NSDictionary *snapshot = nil;
+    os_unfair_lock_lock(&_lock);
+    NSMutableDictionary *entry = self.policies[key];
+    if (entry) {
+        entry[@"titleCipher"] = cipher;
+        snapshot = [self immutableSnapshotLocked];
     }
     os_unfair_lock_unlock(&_lock);
 
-    if (saved) {
-        [self postPolicyDidChangeForThreadId:threadId];
+    if (snapshot) {
+        ZLModWritePropertyListAsync(snapshot, self.storagePath, nil);
     }
-    return saved;
 }
 
 - (void)postPolicyDidChangeForThreadId:(NSString *)threadId {
     NSDictionary *info = (threadId.length > 0) ? @{ ZLModPolicyThreadIdKey: [threadId copy] } : nil;
-    dispatch_async(dispatch_get_main_queue(), ^{
+    ZLModRunOnMainThread(^{
         [[NSNotificationCenter defaultCenter] postNotificationName:ZLModConversationPolicyDidChangeNotification
                                                             object:nil
                                                           userInfo:info];
@@ -386,7 +433,7 @@ static NSString *gActiveConvType = nil;
     if (scope.length == 0) return @[];
     NSString *prefix = [scope stringByAppendingString:@":"];
 
-    NSMutableArray<NSDictionary<NSString *, id> *> *rows = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *rawRows = [NSMutableArray array];
     os_unfair_lock_lock(&_lock);
     [self.policies enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSMutableDictionary *entry, __unused BOOL *stop) {
         if (![key hasPrefix:prefix]) return;
@@ -401,26 +448,68 @@ static NSString *gActiveConvType = nil;
         BOOL localUnread = [entry[@"unread"] boolValue];
         if (!hideSeen && !hideTyping && !localUnread) return;
 
-        [rows addObject:@{
+        NSMutableDictionary *copy = [NSMutableDictionary dictionaryWithDictionary:@{
             @"key": key,
             @"convType": convType,
+            @"threadId": threadId,
             @"threadHash": ZLModSafeIdHash(threadId),
             @"hideSeen": @(hideSeen),
             @"hideTyping": @(hideTyping),
             @"localUnread": @(localUnread),
             @"updatedAt": entry[@"updatedAt"] ?: @0
         }];
+        if ([entry[@"titleCipher"] isKindOfClass:[NSData class]]) {
+            copy[@"titleCipher"] = entry[@"titleCipher"];
+        }
+        [rawRows addObject:copy];
     }];
     os_unfair_lock_unlock(&_lock);
 
-    [rows sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+    [rawRows sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [b[@"updatedAt"] compare:a[@"updatedAt"]];
     }];
+
+    // Decrypt titles outside lock.
+    NSMutableArray<NSDictionary<NSString *, id> *> *rows = [NSMutableArray arrayWithCapacity:rawRows.count];
+    for (NSDictionary *raw in rawRows) {
+        NSString *displayTitle = @"";
+        NSData *cipher = raw[@"titleCipher"];
+        if ([cipher isKindOfClass:[NSData class]]) {
+            NSData *meta = [[self class] titleMetadataForAccountScope:scope
+                                                     conversationType:raw[@"convType"]
+                                                             threadId:raw[@"threadId"]];
+            displayTitle = [[ZLModCryptoBox shared] decryptData:cipher metadata:meta] ?: @"";
+        }
+        [rows addObject:@{
+            @"key": raw[@"key"],
+            @"convType": raw[@"convType"],
+            @"threadHash": raw[@"threadHash"],
+            @"displayTitle": displayTitle,
+            @"hideSeen": raw[@"hideSeen"],
+            @"hideTyping": raw[@"hideTyping"],
+            @"localUnread": raw[@"localUnread"],
+            @"updatedAt": raw[@"updatedAt"]
+        }];
+    }
     return [rows copy];
 }
 
 - (NSUInteger)customizedCountForCurrentAccount {
-    return [self summaryEntriesForCurrentAccount].count;
+    NSString *scope = ZLModCurrentAccountScope();
+    if (scope.length == 0) return 0;
+    NSString *prefix = [scope stringByAppendingString:@":"];
+
+    __block NSUInteger count = 0;
+    os_unfair_lock_lock(&_lock);
+    [self.policies enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSMutableDictionary *entry, __unused BOOL *stop) {
+        if (![key hasPrefix:prefix]) return;
+        BOOL active = ([entry[@"seen"] integerValue] == ZLModSeenPolicyHideSeen) ||
+                      ([entry[@"typing"] integerValue] == ZLModTypingPolicyHideTyping) ||
+                      [entry[@"unread"] boolValue];
+        if (active) count++;
+    }];
+    os_unfair_lock_unlock(&_lock);
+    return count;
 }
 
 - (BOOL)resetPolicyAtCompoundKey:(NSString *)compoundKey {
@@ -429,22 +518,21 @@ static NSString *gActiveConvType = nil;
     NSString *prefix = [scope stringByAppendingString:@":"];
     if (![compoundKey hasPrefix:prefix]) return NO; // fail-closed cross-account guard
 
-    BOOL saved = NO;
+    NSDictionary *snapshot = nil;
+    BOOL removed = NO;
     os_unfair_lock_lock(&_lock);
-    NSMutableDictionary *prev = self.policies[compoundKey];
-    if (prev) {
+    if (self.policies[compoundKey]) {
         [self.policies removeObjectForKey:compoundKey];
-        saved = [self persistLocked];
-        if (!saved) {
-            self.policies[compoundKey] = prev;
-        }
+        snapshot = [self immutableSnapshotLocked];
+        removed = YES;
     }
     os_unfair_lock_unlock(&_lock);
 
-    if (saved) {
+    if (removed) {
+        ZLModWritePropertyListAsync(snapshot, self.storagePath, nil);
         [self postPolicyDidChangeForThreadId:nil];
     }
-    return saved;
+    return removed;
 }
 
 - (NSUInteger)resetPoliciesForCurrentAccount {
@@ -452,37 +540,35 @@ static NSString *gActiveConvType = nil;
     if (scope.length == 0) return 0;
     NSString *prefix = [scope stringByAppendingString:@":"];
 
+    NSDictionary *snapshot = nil;
     NSUInteger removedCount = 0;
     os_unfair_lock_lock(&_lock);
-    NSMutableDictionary *backup = [NSMutableDictionary dictionary];
     NSMutableArray<NSString *> *toRemove = [NSMutableArray array];
     for (NSString *key in self.policies) {
-        if ([key hasPrefix:prefix]) {
-            [toRemove addObject:key];
-            backup[key] = self.policies[key];
-        }
+        if ([key hasPrefix:prefix]) [toRemove addObject:key];
     }
     if (toRemove.count > 0) {
         [self.policies removeObjectsForKeys:toRemove];
-        if ([self persistLocked]) {
-            removedCount = toRemove.count;
-        } else {
-            [self.policies addEntriesFromDictionary:backup];
-        }
+        removedCount = toRemove.count;
+        snapshot = [self immutableSnapshotLocked];
     }
     os_unfair_lock_unlock(&_lock);
 
     if (removedCount > 0) {
+        ZLModWritePropertyListAsync(snapshot, self.storagePath, nil);
         [self postPolicyDidChangeForThreadId:nil];
     }
     return removedCount;
 }
 
 - (void)resetAllPolicies {
+    NSDictionary *snapshot = nil;
     os_unfair_lock_lock(&_lock);
     [self.policies removeAllObjects];
-    [[NSFileManager defaultManager] removeItemAtPath:self.storagePath error:nil];
+    snapshot = [self immutableSnapshotLocked];
     os_unfair_lock_unlock(&_lock);
+
+    ZLModWritePropertyListAsync(snapshot, self.storagePath, nil);
     [self postPolicyDidChangeForThreadId:nil];
     ZLMOD_LOG(@"policy store: all policies reset");
 }

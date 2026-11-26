@@ -4,26 +4,27 @@ on:
   workflow_dispatch:
     inputs:
       release_name:
-        description: "Tên bản Release (VD: ZLMod Build 10 — C-Bridge Edition)"
+        description: "Tên bản Release (VD: ZLMod Build 11 — Modular Architecture Rebuild)"
         required: true
-        default: "ZLMod Build 10 — C-Bridge Edition"
+        default: "ZLMod Build 11 — Modular Architecture Rebuild"
       release_tag:
-        description: "Git Tag cho bản phát hành (VD: build-10)"
+        description: "Git Tag cho bản phát hành (VD: build-11)"
         required: true
-        default: "build-10"
+        default: "build-11"
       release_description:
         description: "Mô tả chi tiết nội dung phát hành (Hỗ trợ Markdown)"
         required: false
         type: string
         default: |
-          ## 🚀 ZLMod — Tùy biến Native cho Zalo iOS (C-Bridge Edition)
+          ## 🚀 ZLMod 4.0 (Build 11) — Modular Architecture Rebuild
 
-          ### ✨ Các tính năng mới:
-          - **C-Bridge & Local Server**: Kết nối thời gian thực qua kênh đôi native WebSocket (`NSURLSessionWebSocketTask`) tới Local Server (`zalo-meet-bot`).
-          - **CPairing**: Tự động nhận diện thiết bị và máy chủ trong cùng mạng nội bộ (Heartbeat 20s).
-          - **CSaving**: Chuyển tiếp và lưu trữ mọi loại tin nhắn (Text, Photo, Sticker, Voice, File, Undo) vào SQLite trên Local Server với cơ chế deduplication và bộ đệm an toàn.
-          - **CDeploy (Đồng bộ 2 chiều)**: Cho phép đẩy cấu hình lên server. Khi server gửi cấu hình mới xuống, app hiển thị hộp thoại xác nhận an toàn trước khi nạp vào máy.
-          - **Discord Webhook Relay**: Hỗ trợ chuyển tiếp cảnh báo và thông báo khẩn cấp tới kênh Discord đã cấu hình.
+          ### ✨ Các nâng cấp trọng tâm:
+          - **Kiến trúc Event Bus tách biệt**: `ZLModMessageTapBus` + `ZLModChatEntityAdapter` tách hoàn toàn `CSaving` & `DiscordRelay` khỏi `AntiRecall`.
+          - **Bảo mật Keychain-only**: `ZLModSecretStore` lưu `Bridge Token` và `Discord Webhook URL` hoàn toàn trong iOS Keychain, kèm tự động di chuyển & xóa dữ liệu plaintext cũ và kiểm tra `ZLModStorageHealth`.
+          - **C-Bridge WebSocket FSM 4 trạng thái**: Chống race condition bằng `connectionEpoch`, exponential backoff (2s–30s), heartbeat 20s + pong timeout 10s, quét máy chủ LAN tự động qua Bonjour/mDNS, giữ nguyên thứ tự tin nhắn khi gửi lại CSaving, và CDeploy allowlist chặt chẽ kèm guaranteed ACK.
+          - **Discord Webhook Relay tự động**: Tự động chuyển tiếp tin nhắn mới và tin nhắn bị thu hồi (kèm nội dung gốc) với kiểm tra tên miền chính thức, chống trùng lặp và giới hạn tốc độ.
+          - **Anti-Recall & Tiện ích hoàn thiện**: Lưu ảnh thu hồi mã hóa trên đĩa (quota 20MB / TTL 14 ngày), sửa lỗi nhận diện sai từ "thu hồi", sửa dọn cell reuse, Ghi chú nhiều dòng, Quick Reply theo tài khoản + nút chèn nhanh trong khung chat, Delay Send đa tin nhắn tránh bàn phím.
+          - **Mach-O & Packaging**: Sửa căn chỉnh 8-byte cho `LC_RPATH` trên arm64, hoàn thiện trạng thái ký một phần của IPA preflight, đồng bộ phiên bản từ `Resources/version.json`.
 
           ---
           ### 📦 Các bản IPA cung cấp sẵn bên dưới:
@@ -31,6 +32,11 @@ on:
           2. **Bản đầy đủ (Full):** Dành cho TrollStore hoặc tài khoản Apple Developer trả phí.
       decrypted_ipa_url:
         description: "URL tải file IPA Zalo decrypted (nếu đã để file trong thư mục Decrypted/ thì có thể để trống)"
+        required: false
+        type: string
+        default: ""
+      decrypted_ipa_sha256:
+        description: "SHA-256 tùy chọn để xác minh file tải từ decrypted_ipa_url"
         required: false
         type: string
         default: ""
@@ -109,6 +115,13 @@ jobs:
           if [ -n "${{ inputs.decrypted_ipa_url }}" ]; then
             echo "[*] Downloading decrypted base IPA from URL: ${{ inputs.decrypted_ipa_url }}..."
             curl -fSL -A "Mozilla/5.0" -o /tmp/base_decrypted.ipa "${{ inputs.decrypted_ipa_url }}"
+            if [ -n "${{ inputs.decrypted_ipa_sha256 }}" ]; then
+              ACTUAL_SHA=$(shasum -a 256 /tmp/base_decrypted.ipa | awk '{print $1}')
+              if [ "$ACTUAL_SHA" != "${{ inputs.decrypted_ipa_sha256 }}" ]; then
+                echo "ERROR: SHA-256 mismatch for downloaded IPA ($ACTUAL_SHA != ${{ inputs.decrypted_ipa_sha256 }})" >&2
+                exit 1
+              fi
+            fi
             if unzip -tq /tmp/base_decrypted.ipa > /dev/null 2>&1; then
               DECRYPTED_IPA="/tmp/base_decrypted.ipa"
             else
@@ -163,6 +176,10 @@ jobs:
             --allow-custom-bundle-id \
             --dylib build/libZLMod.dylib \
             --no-appex
+
+          echo "[*] Running IPA preflight verification on both outputs..."
+          python3 Packaging/ipa_preflight.py "build/Zalo-ZLMod-${{ inputs.release_tag }}-full-unsigned.ipa" --require-unencrypted-main
+          python3 Packaging/ipa_preflight.py "build/Zalo-ZLMod-${{ inputs.release_tag }}-noappex-unsigned.ipa" --require-unencrypted-main
 
           echo "[*] Generating SHA256 checksums for repacked IPAs..."
           cd build

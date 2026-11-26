@@ -2,21 +2,13 @@
 // Inbox long-press context menu injection (Seen/Typing per-conversation toggles,
 // Local Unread mark, Encrypted Private Note) and live unread blue-dot indicator
 // across UXInboxMessageCell and ChatListItemCell.
+// Note: ZLModShowToast now lives in MODULE 04 (ZLModOverlayUI.m) — zero reverse dependency from Core.
 
 #import "ZLMod.h"
 #import <os/lock.h>
 
-static const NSInteger kZLModActionToggleSeen   = 98001;
-static const NSInteger kZLModActionToggleTyping = 98002;
-static const NSInteger kZLModActionToggleUnread = 98003;
-static const NSInteger kZLModActionPrivateNote  = 98004;
-
-static const NSInteger kZLModToastViewTag       = 0x5A1C;
-static const NSInteger kZLModUnreadDotViewTag   = 0x5A1D;
-static const NSTimeInterval kZLModMenuSessionTTL = 120.0;
-
-static const void *kZLModMenuSessionAssocKey    = &kZLModMenuSessionAssocKey;
-static const void *kZLModCellThreadIdAssocKey   = &kZLModCellThreadIdAssocKey;
+static const void *kZLModMenuSessionAssocKey  = &kZLModMenuSessionAssocKey;
+static const void *kZLModCellThreadIdAssocKey = &kZLModCellThreadIdAssocKey;
 
 #pragma mark - Immutable menu session
 
@@ -59,73 +51,7 @@ static os_unfair_lock gMenuSessionLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSString *, ZLModMenuSession *> *gMenuSessions = nil;
 static ZLModMenuSession *gLatestMenuSession = nil;
 static NSHashTable<UIView *> *gTrackedInboxCells = nil;
-
-#pragma mark - Toast helper (non-interactive)
-
-void ZLModShowToast(NSString *message) {
-    if (!message || message.length == 0) return;
-    if (![NSThread isMainThread]) {
-        NSString *copied = [message copy];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            ZLModShowToast(copied);
-        });
-        return;
-    }
-
-    UIWindow *window = ZLModActiveKeyWindow();
-    if (!window) return;
-
-    UIView *existing = [window viewWithTag:kZLModToastViewTag];
-    if (existing) {
-        [existing removeFromSuperview];
-    }
-
-    UIView *banner = [[UIView alloc] init];
-    banner.tag = kZLModToastViewTag;
-    banner.userInteractionEnabled = NO;
-    banner.backgroundColor = [[UIColor colorWithWhite:0.12 alpha:0.92] colorWithAlphaComponent:0.94];
-    banner.layer.cornerRadius = 18.0;
-    banner.layer.masksToBounds = YES;
-
-    UILabel *label = [[UILabel alloc] init];
-    label.text = message;
-    label.textColor = [UIColor whiteColor];
-    label.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightMedium];
-    label.numberOfLines = 2;
-    label.textAlignment = NSTextAlignmentCenter;
-
-    CGFloat maxWidth = MAX(window.bounds.size.width - 40.0, 200.0);
-    CGSize textSize = [label sizeThatFits:CGSizeMake(maxWidth - 32.0, 60.0)];
-    CGFloat bannerW = MIN(MAX(textSize.width + 32.0, 160.0), maxWidth);
-    CGFloat bannerH = MAX(textSize.height + 16.0, 36.0);
-    CGFloat topY = MAX(window.safeAreaInsets.top + 8.0, 44.0);
-
-    banner.frame = CGRectMake((window.bounds.size.width - bannerW) * 0.5, topY, bannerW, bannerH);
-    label.frame = CGRectInset(banner.bounds, 14.0, 6.0);
-    [banner addSubview:label];
-
-    banner.alpha = 0.0;
-    banner.transform = CGAffineTransformMakeTranslation(0.0, -8.0);
-    [window addSubview:banner];
-
-    [UIView animateWithDuration:0.2
-                     animations:^{
-        banner.alpha = 1.0;
-        banner.transform = CGAffineTransformIdentity;
-    } completion:^(__unused BOOL finished) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.1 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (!banner.superview) return;
-            [UIView animateWithDuration:0.2
-                             animations:^{
-                banner.alpha = 0.0;
-            } completion:^(__unused BOOL done) {
-                [banner removeFromSuperview];
-            }];
-        });
-    }];
-}
-
+static BOOL gConversationMenuObserversInstalled = NO;
 
 #pragma mark - Session registry
 
@@ -139,12 +65,24 @@ static void ZLModRegisterMenuSession(ZLModMenuSession *session) {
     }
     NSMutableArray<NSString *> *expired = [NSMutableArray array];
     [gMenuSessions enumerateKeysAndObjectsUsingBlock:^(NSString *sid, ZLModMenuSession *entry, __unused BOOL *stop) {
-        if ((now - entry.createdAt) > kZLModMenuSessionTTL || entry.executed) {
+        if ((now - entry.createdAt) > kZLModMenuSessionTTLSeconds || entry.executed) {
             [expired addObject:sid];
         }
     }];
     if (expired.count > 0) {
         [gMenuSessions removeObjectsForKeys:expired];
+    }
+    while (gMenuSessions.count >= kZLModMenuSessionMaxCount) {
+        NSString *oldestKey = nil;
+        NSTimeInterval oldestTs = DBL_MAX;
+        for (NSString *k in gMenuSessions) {
+            if (gMenuSessions[k].createdAt < oldestTs) {
+                oldestTs = gMenuSessions[k].createdAt;
+                oldestKey = k;
+            }
+        }
+        if (oldestKey) [gMenuSessions removeObjectForKey:oldestKey];
+        else break;
     }
     gMenuSessions[session.sessionId] = session;
     gLatestMenuSession = session;
@@ -161,15 +99,11 @@ static ZLModMenuSession *ZLModConsumeMenuSessionForIdentifier(id menuObj, id ide
 
     if (identifier) {
         ZLModMenuSession *assoc = objc_getAssociatedObject(identifier, kZLModMenuSessionAssocKey);
-        if ([assoc isKindOfClass:[ZLModMenuSession class]]) {
-            candidate = assoc;
-        }
+        if ([assoc isKindOfClass:[ZLModMenuSession class]]) candidate = assoc;
     }
     if (!candidate && menuObj) {
         ZLModMenuSession *assoc = objc_getAssociatedObject(menuObj, kZLModMenuSessionAssocKey);
-        if ([assoc isKindOfClass:[ZLModMenuSession class]]) {
-            candidate = assoc;
-        }
+        if ([assoc isKindOfClass:[ZLModMenuSession class]]) candidate = assoc;
     }
     if (!candidate && [identifier isKindOfClass:[NSString class]]) {
         NSString *idStr = (NSString *)identifier;
@@ -193,7 +127,7 @@ static ZLModMenuSession *ZLModConsumeMenuSessionForIdentifier(id menuObj, id ide
 
     if (!candidate ||
         candidate.executed ||
-        (now - candidate.createdAt) > kZLModMenuSessionTTL ||
+        (now - candidate.createdAt) > kZLModMenuSessionTTLSeconds ||
         ![candidate.accountScope isEqualToString:currentScope]) {
         os_unfair_lock_unlock(&gMenuSessionLock);
         return nil;
@@ -229,7 +163,7 @@ static NSString *ZLModExtractThreadIdFromInboxItem(id item) {
             }
         }
     }
-    return nil;
+    return [ZLModChatEntityAdapter extractThreadIdFromObject:item];
 }
 
 static NSString *ZLModExtractTitleFromInboxItem(id item) {
@@ -241,6 +175,8 @@ static NSString *ZLModExtractTitleFromInboxItem(id item) {
     }
     NSString *direct = ZLModSafeStringProperty(item, sel_registerName("title"));
     if (direct.length > 0) return direct;
+    NSString *adapted = [ZLModChatEntityAdapter extractDisplayTitleFromObject:item];
+    if (adapted.length > 0) return adapted;
     return @"Cuộc trò chuyện";
 }
 
@@ -252,7 +188,7 @@ static NSString *ZLModExtractConvTypeFromInboxItem(id item) {
     }
     int64_t msgType = ZLModSafeInt64Property(item, sel_registerName("messageType"), 0);
     if (msgType == 2) return @"group";
-    return @"single";
+    return [[ZLModChatEntityAdapter extractConversationTypeFromObject:item] isEqualToString:@"group"] ? @"group" : @"single";
 }
 
 static BOOL ZLModIsEligibleInboxMessageItem(id item) {
@@ -270,10 +206,20 @@ static BOOL ZLModIsEligibleInboxMessageItem(id item) {
     return YES;
 }
 
-// Copies every visual attribute the native menu renderer dereferences (ZDSColor
-// text/icon colors, disabled colors, promote type, padding) from a genuine model so the
-// injected rows are structurally identical to Zalo's own rows. Rows built with nil
-// ZDSColor values crash the renderer as soon as the menu is shown.
+static id ZLModFindMenuTemplateInList(NSArray *list, Class vmCls) {
+    if (!vmCls || ![list isKindOfClass:[NSArray class]]) return nil;
+    for (id element in list) {
+        if ([element isKindOfClass:vmCls]) return element;
+        if ([element isKindOfClass:[NSArray class]]) {
+            id nested = ZLModFindMenuTemplateInList((NSArray *)element, vmCls);
+            if (nested) return nested;
+        }
+    }
+    return nil;
+}
+
+// Copies visual attributes (ZDSColor text/icon colors, disabled colors, promote type, padding)
+// from a genuine native row model so injected rows render without nil-color crashes.
 static void ZLModCopyMenuAppearance(id from, id to) {
     static NSArray<NSArray<NSString *> *> *pairs;
     static dispatch_once_t once;
@@ -314,11 +260,7 @@ static id ZLModMakeContextMenuViewModel(NSInteger actionId,
     if (!vmClass || !template) return nil;
 
     id vm = nil;
-    @try {
-        vm = [[vmClass alloc] init];
-    } @catch (__unused NSException *e) {
-        return nil;
-    }
+    @try { vm = [[vmClass alloc] init]; } @catch (__unused NSException *e) { return nil; }
     if (!vm) return nil;
     ZLModCopyMenuAppearance(template, vm);
 
@@ -332,14 +274,12 @@ static id ZLModMakeContextMenuViewModel(NSInteger actionId,
         ((void (*)(id, SEL, NSInteger))objc_msgSend)(vm, setMenuTypeSel, actionId);
     }
 
-    {
-        UIImage *icon = symbolName.length > 0 ? [UIImage systemImageNamed:symbolName] : nil;
-        if (!icon) icon = [UIImage systemImageNamed:@"circle"];
-        icon = [icon imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
-        SEL setIconSel = sel_registerName("setIconImage:");
-        if (icon && [vm respondsToSelector:setIconSel]) {
-            ((void (*)(id, SEL, id))objc_msgSend)(vm, setIconSel, icon);
-        }
+    UIImage *icon = symbolName.length > 0 ? [UIImage systemImageNamed:symbolName] : nil;
+    if (!icon) icon = [UIImage systemImageNamed:@"circle"];
+    icon = [icon imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    SEL setIconSel = sel_registerName("setIconImage:");
+    if (icon && [vm respondsToSelector:setIconSel]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(vm, setIconSel, icon);
     }
 
     SEL setAccessIdSel = sel_registerName("setAccessibilityIdentifier:");
@@ -375,7 +315,6 @@ static id ZLModMakeContextMenuAction(NSInteger actionId,
             return action;
         }
     }
-
     return ZLModMakeContextMenuViewModel(actionId, title, symbolName, session, template);
 }
 
@@ -384,9 +323,7 @@ static id ZLModMakeContextMenuAction(NSInteger actionId,
 static NSString *ZLModResolveThreadIdForCell(UIView *cell) {
     if (!cell) return nil;
     NSString *assoc = objc_getAssociatedObject(cell, kZLModCellThreadIdAssocKey);
-    if ([assoc isKindOfClass:[NSString class]] && assoc.length > 0) {
-        return assoc;
-    }
+    if ([assoc isKindOfClass:[NSString class]] && assoc.length > 0) return assoc;
     for (NSString *selName in @[@"messageItem", @"cachedItem", @"listItem"]) {
         id item = ZLModSafeObjectProperty(cell, NSSelectorFromString(selName));
         NSString *tid = ZLModExtractThreadIdFromInboxItem(item);
@@ -404,7 +341,7 @@ static void ZLModUpdateUnreadDotForCell(UIView *cell) {
     NSString *tid = ZLModResolveThreadIdForCell(cell);
     BOOL showDot = (tid.length > 0) && [[ZLModConversationPolicyStore shared] isLocalUnreadAnyTypeForThreadId:tid];
 
-    UIView *dot = [container viewWithTag:kZLModUnreadDotViewTag];
+    UIView *dot = [container viewWithTag:kZLModUnreadBlueDotViewTag];
     if (!showDot) {
         if (dot) dot.hidden = YES;
         return;
@@ -412,8 +349,11 @@ static void ZLModUpdateUnreadDotForCell(UIView *cell) {
 
     if (!dot) {
         dot = [[UIView alloc] initWithFrame:CGRectMake(10.0, 12.0, 10.0, 10.0)];
-        dot.tag = kZLModUnreadDotViewTag;
+        dot.tag = kZLModUnreadBlueDotViewTag;
         dot.userInteractionEnabled = NO;
+        dot.isAccessibilityElement = YES;
+        dot.accessibilityLabel = @"Đánh dấu chưa đọc cục bộ";
+        dot.accessibilityIdentifier = @"zlmod.unread.dot";
         dot.backgroundColor = [UIColor colorWithRed:0.0 green:104.0 / 255.0 blue:1.0 alpha:1.0];
         dot.layer.cornerRadius = 5.0;
         dot.layer.borderWidth = 1.5;
@@ -427,32 +367,24 @@ static void ZLModUpdateUnreadDotForCell(UIView *cell) {
 
 static void ZLModTrackAndRefreshInboxCell(UIView *cell, id item) {
     if (!cell || ![cell isKindOfClass:[UIView class]]) return;
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            ZLModTrackAndRefreshInboxCell(cell, item);
-        });
-        return;
-    }
-    if (!gTrackedInboxCells) {
-        gTrackedInboxCells = [NSHashTable weakObjectsHashTable];
-    }
-    [gTrackedInboxCells addObject:cell];
+    ZLModRunOnMainThread(^{
+        if (!gTrackedInboxCells) {
+            gTrackedInboxCells = [NSHashTable weakObjectsHashTable];
+        }
+        [gTrackedInboxCells addObject:cell];
 
-    NSString *tid = ZLModExtractThreadIdFromInboxItem(item);
-    objc_setAssociatedObject(cell, kZLModCellThreadIdAssocKey, tid, OBJC_ASSOCIATION_COPY_NONATOMIC);
-    ZLModUpdateUnreadDotForCell(cell);
+        NSString *tid = ZLModExtractThreadIdFromInboxItem(item);
+        objc_setAssociatedObject(cell, kZLModCellThreadIdAssocKey, tid, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        ZLModUpdateUnreadDotForCell(cell);
+    });
 }
 
 static void ZLModRefreshAllTrackedInboxCells(void) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            ZLModRefreshAllTrackedInboxCells();
-        });
-        return;
-    }
-    for (UIView *cell in gTrackedInboxCells) {
-        ZLModUpdateUnreadDotForCell(cell);
-    }
+    ZLModRunOnMainThread(^{
+        for (UIView *cell in gTrackedInboxCells) {
+            ZLModUpdateUnreadDotForCell(cell);
+        }
+    });
 }
 
 #pragma mark - Action handler
@@ -465,10 +397,11 @@ static void ZLModExecuteMenuAction(NSInteger actionId, ZLModMenuSession *session
     NSString *ctype = session.conversationType;
     NSString *tid = session.threadId;
 
-    if (actionId == kZLModActionToggleSeen) {
+    if (actionId == kZLModConvActionHideSeen) {
         ZLModSeenPolicy cur = [policyStore seenPolicyForAccountScope:scope conversationType:ctype threadId:tid];
         ZLModSeenPolicy next = (cur == ZLModSeenPolicyHideSeen) ? ZLModSeenPolicyFollowOriginal : ZLModSeenPolicyHideSeen;
         if ([policyStore setSeenPolicy:next forAccountScope:scope conversationType:ctype threadId:tid]) {
+            [policyStore updateDisplayTitle:session.displayTitle forAccountScope:scope conversationType:ctype threadId:tid];
             ZLModShowToast(next == ZLModSeenPolicyHideSeen
                            ? @"Đã bật Ẩn đã xem cho cuộc trò chuyện này"
                            : @"Đã tắt Ẩn đã xem cho cuộc trò chuyện này");
@@ -478,10 +411,11 @@ static void ZLModExecuteMenuAction(NSInteger actionId, ZLModMenuSession *session
         return;
     }
 
-    if (actionId == kZLModActionToggleTyping) {
+    if (actionId == kZLModConvActionHideTyping) {
         ZLModTypingPolicy cur = [policyStore typingPolicyForAccountScope:scope conversationType:ctype threadId:tid];
         ZLModTypingPolicy next = (cur == ZLModTypingPolicyHideTyping) ? ZLModTypingPolicyFollowOriginal : ZLModTypingPolicyHideTyping;
         if ([policyStore setTypingPolicy:next forAccountScope:scope conversationType:ctype threadId:tid]) {
+            [policyStore updateDisplayTitle:session.displayTitle forAccountScope:scope conversationType:ctype threadId:tid];
             ZLModShowToast(next == ZLModTypingPolicyHideTyping
                            ? @"Đã bật Ẩn đang nhập cho cuộc trò chuyện này"
                            : @"Đã tắt Ẩn đang nhập cho cuộc trò chuyện này");
@@ -491,10 +425,11 @@ static void ZLModExecuteMenuAction(NSInteger actionId, ZLModMenuSession *session
         return;
     }
 
-    if (actionId == kZLModActionToggleUnread) {
+    if (actionId == kZLModConvActionLocalUnread) {
         BOOL cur = [policyStore isLocalUnreadForAccountScope:scope conversationType:ctype threadId:tid];
         BOOL next = !cur;
         if ([policyStore setLocalUnread:next forAccountScope:scope conversationType:ctype threadId:tid]) {
+            [policyStore updateDisplayTitle:session.displayTitle forAccountScope:scope conversationType:ctype threadId:tid];
             ZLModRefreshAllTrackedInboxCells();
             ZLModShowToast(next ? @"Đã đánh dấu chưa đọc (Chấm xanh)" : @"Đã bỏ đánh dấu chưa đọc");
         } else {
@@ -503,8 +438,8 @@ static void ZLModExecuteMenuAction(NSInteger actionId, ZLModMenuSession *session
         return;
     }
 
-    if (actionId == kZLModActionPrivateNote) {
-        dispatch_async(dispatch_get_main_queue(), ^{
+    if (actionId == kZLModConvActionPrivateNote) {
+        ZLModRunOnMainThread(^{
             UIViewController *presenter = ZLModTopPresenterViewController();
             if (!presenter) {
                 ZLModShowToast(@"Không tìm thấy màn hình để mở ghi chú");
@@ -519,116 +454,138 @@ static void ZLModExecuteMenuAction(NSInteger actionId, ZLModMenuSession *session
     }
 }
 
+static BOOL ZLModArrayAlreadyContainsZLModAction(NSArray *list) {
+    if (![list isKindOfClass:[NSArray class]]) return NO;
+    for (id element in list) {
+        if (objc_getAssociatedObject(element, kZLModMenuSessionAssocKey) != nil) return YES;
+        if ([element isKindOfClass:[NSArray class]] && ZLModArrayAlreadyContainsZLModAction((NSArray *)element)) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static NSArray *ZLModAppendMenuActionsToArray(id ownerObj, id item, NSArray *origArray) {
+    if (![origArray isKindOfClass:[NSArray class]]) return origArray;
+    if (ZLModArrayAlreadyContainsZLModAction(origArray)) return origArray;
+    if (!ZLModIsEligibleInboxMessageItem(item)) return origArray;
+
+    Class modernActionCls = NSClassFromString(@"_TtC13ZAContextMenu19ZAContextMenuAction");
+    Class vmCls = NSClassFromString(@"ContextMenuViewModel");
+    id template = ZLModFindMenuTemplateInList(origArray, vmCls);
+    if (!modernActionCls && !template) return origArray;
+
+    NSString *tid = ZLModExtractThreadIdFromInboxItem(item);
+    NSString *scope = ZLModCurrentAccountScope();
+    if (tid.length == 0 || scope.length == 0) return origArray;
+
+    NSString *ctype = ZLModExtractConvTypeFromInboxItem(item);
+    NSString *title = ZLModExtractTitleFromInboxItem(item);
+
+    ZLModMenuSession *session = [[ZLModMenuSession alloc] initWithThreadId:tid
+                                                          conversationType:ctype
+                                                              displayTitle:title
+                                                              accountScope:scope];
+    ZLModRegisterMenuSession(session);
+    objc_setAssociatedObject(ownerObj, kZLModMenuSessionAssocKey, session, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(item, kZLModMenuSessionAssocKey, session, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    ZLModConversationPolicyStore *policyStore = [ZLModConversationPolicyStore shared];
+    BOOL hideSeen = ([policyStore seenPolicyForAccountScope:scope conversationType:ctype threadId:tid] == ZLModSeenPolicyHideSeen);
+    BOOL hideTyping = ([policyStore typingPolicyForAccountScope:scope conversationType:ctype threadId:tid] == ZLModTypingPolicyHideTyping);
+    BOOL unread = [policyStore isLocalUnreadForAccountScope:scope conversationType:ctype threadId:tid];
+    BOOL hasNote = ([[ZLModPrivateNotesStore shared] noteForThreadId:tid].length > 0);
+
+    BOOL isSectioned = (origArray.count > 0 && [origArray.firstObject isKindOfClass:[NSArray class]]);
+    NSMutableArray *customItems = [NSMutableArray arrayWithCapacity:4];
+
+    id a1 = ZLModMakeContextMenuAction(kZLModConvActionHideSeen,
+                                       hideSeen ? @"Tắt Ẩn đã xem (Đang bật)" : @"Bật Ẩn đã xem cuộc trò chuyện",
+                                       hideSeen ? @"eye.fill" : @"eye.slash",
+                                       session, template);
+    id a2 = ZLModMakeContextMenuAction(kZLModConvActionHideTyping,
+                                       hideTyping ? @"Tắt Ẩn đang nhập (Đang bật)" : @"Bật Ẩn đang nhập cuộc trò chuyện",
+                                       hideTyping ? @"keyboard" : @"keyboard.chevron.compact.down",
+                                       session, template);
+    id a3 = ZLModMakeContextMenuAction(kZLModConvActionLocalUnread,
+                                       unread ? @"Bỏ đánh dấu chưa đọc" : @"Đánh dấu chưa đọc (Chấm xanh)",
+                                       unread ? @"envelope.open" : @"envelope.badge",
+                                       session, template);
+    id a4 = ZLModMakeContextMenuAction(kZLModConvActionPrivateNote,
+                                       hasNote ? @"Ghi chú riêng tư (Đã có)" : @"Thêm ghi chú riêng tư...",
+                                       hasNote ? @"note.text" : @"note.text.badge.plus",
+                                       session, template);
+    if (a1) [customItems addObject:a1];
+    if (a2) [customItems addObject:a2];
+    if (a3) [customItems addObject:a3];
+    if (a4) [customItems addObject:a4];
+    if (customItems.count == 0) return origArray;
+
+    if (isSectioned) {
+        NSMutableArray *sections = [origArray mutableCopy];
+        NSUInteger insertIdx = (sections.count > 1) ? (sections.count - 1) : sections.count;
+        [sections insertObject:[customItems copy] atIndex:insertIdx];
+        return [sections copy];
+    }
+    NSMutableArray *combined = [origArray mutableCopy];
+    [combined addObjectsFromArray:customItems];
+    return [combined copy];
+}
+
 #pragma mark - Install hooks
 
 static NSUInteger ZLModInstallInboxContextMenuHooks(void) {
-    Class mgrClass = NSClassFromString(@"InboxContextMenuManager");
-    if (!mgrClass) return 0;
-
     NSUInteger installed = 0;
 
-    // 1. -getActionsWithItem: [@24@0:8@16]
-    SEL getActionsSel = sel_registerName("getActionsWithItem:");
-    if (ZLModClassHasInstanceMethod(mgrClass, getActionsSel)) {
-        IMP orig = class_getMethodImplementation(mgrClass, getActionsSel);
-        if (ZLModReplaceMethod(mgrClass, getActionsSel, 1, "@", ^id(id selfObj, id item) {
-            id origList = orig ? ((id (*)(id, SEL, id))orig)(selfObj, getActionsSel, item) : nil;
-            if (![origList isKindOfClass:[NSArray class]]) return origList;
-            if (!ZLModIsEligibleInboxMessageItem(item)) return origList;
+    Class mgrClass = NSClassFromString(@"InboxContextMenuManager");
+    if (mgrClass) {
+        // 1. -getActionsWithItem: [@24@0:8@16]
+        SEL getActionsSel = sel_registerName("getActionsWithItem:");
+        if (ZLModClassHasInstanceMethod(mgrClass, getActionsSel)) {
+            IMP orig = class_getMethodImplementation(mgrClass, getActionsSel);
+            if (ZLModReplaceMethod(mgrClass, getActionsSel, 1, "@", ^id(id selfObj, id item) {
+                id origList = orig ? ((id (*)(id, SEL, id))orig)(selfObj, getActionsSel, item) : nil;
+                if (![origList isKindOfClass:[NSArray class]]) return origList;
+                return ZLModAppendMenuActionsToArray(selfObj, item, (NSArray *)origList);
+            })) {
+                installed++;
+            }
+        }
 
-            Class modernActionCls = NSClassFromString(@"_TtC13ZAContextMenu19ZAContextMenuAction");
-            Class vmCls = NSClassFromString(@"ContextMenuViewModel");
-            id template = nil;
-            if (vmCls) {
-                for (id candidate in (NSArray *)origList) {
-                    if ([candidate isKindOfClass:vmCls]) { template = candidate; break; }
+        // 2. -contextMenu:didSelectActionId:forIdentifier: [v40@0:8@16q24@32]
+        SEL selectSel = sel_registerName("contextMenu:didSelectActionId:forIdentifier:");
+        if (ZLModClassHasInstanceMethod(mgrClass, selectSel)) {
+            IMP orig = class_getMethodImplementation(mgrClass, selectSel);
+            if (ZLModReplaceMethod(mgrClass, selectSel, 3, "v", ^(id selfObj, id menu, NSInteger actionId, id identifier) {
+                if (actionId >= kZLModConvActionHideSeen && actionId <= kZLModConvActionPrivateNote) {
+                    ZLModMenuSession *session = ZLModConsumeMenuSessionForIdentifier(menu ?: selfObj, identifier);
+                    if (session) {
+                        ZLModExecuteMenuAction(actionId, session);
+                    } else {
+                        ZLModShowToast(@"Phiên menu đã hết hạn — vui lòng thử lại");
+                    }
+                    return;
                 }
+                if (orig) ((void (*)(id, SEL, id, NSInteger, id))orig)(selfObj, selectSel, menu, actionId, identifier);
+            })) {
+                installed++;
             }
-            if (!modernActionCls && !template) return origList; // never inject rows we cannot style like native ones
-
-            NSString *tid = ZLModExtractThreadIdFromInboxItem(item);
-            NSString *scope = ZLModCurrentAccountScope();
-            if (tid.length == 0 || scope.length == 0) return origList;
-
-            NSString *ctype = ZLModExtractConvTypeFromInboxItem(item);
-            NSString *title = ZLModExtractTitleFromInboxItem(item);
-
-            ZLModMenuSession *session = [[ZLModMenuSession alloc] initWithThreadId:tid
-                                                                  conversationType:ctype
-                                                                      displayTitle:title
-                                                                      accountScope:scope];
-            ZLModRegisterMenuSession(session);
-            objc_setAssociatedObject(selfObj, kZLModMenuSessionAssocKey, session, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(item, kZLModMenuSessionAssocKey, session, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-            ZLModConversationPolicyStore *policyStore = [ZLModConversationPolicyStore shared];
-            BOOL hideSeen = ([policyStore seenPolicyForAccountScope:scope conversationType:ctype threadId:tid] == ZLModSeenPolicyHideSeen);
-            BOOL hideTyping = ([policyStore typingPolicyForAccountScope:scope conversationType:ctype threadId:tid] == ZLModTypingPolicyHideTyping);
-            BOOL unread = [policyStore isLocalUnreadForAccountScope:scope conversationType:ctype threadId:tid];
-            BOOL hasNote = ([[ZLModPrivateNotesStore shared] noteForThreadId:tid].length > 0);
-
-            NSArray *origArray = (NSArray *)origList;
-            BOOL isSectioned = (origArray.count > 0 && [origArray.firstObject isKindOfClass:[NSArray class]]);
-
-            NSMutableArray *customItems = [NSMutableArray arrayWithCapacity:4];
-            id a1 = ZLModMakeContextMenuAction(kZLModActionToggleSeen,
-                                               hideSeen ? @"Tắt Ẩn đã xem (Đang bật)" : @"Bật Ẩn đã xem cuộc trò chuyện",
-                                               hideSeen ? @"eye.fill" : @"eye.slash",
-                                               session,
-                                               template);
-            id a2 = ZLModMakeContextMenuAction(kZLModActionToggleTyping,
-                                               hideTyping ? @"Tắt Ẩn đang nhập (Đang bật)" : @"Bật Ẩn đang nhập cuộc trò chuyện",
-                                               hideTyping ? @"keyboard" : @"keyboard.chevron.compact.down",
-                                               session,
-                                               template);
-            id a3 = ZLModMakeContextMenuAction(kZLModActionToggleUnread,
-                                               unread ? @"Bỏ đánh dấu chưa đọc" : @"Đánh dấu chưa đọc (Chấm xanh)",
-                                               unread ? @"envelope.open" : @"envelope.badge",
-                                               session,
-                                               template);
-            id a4 = ZLModMakeContextMenuAction(kZLModActionPrivateNote,
-                                               hasNote ? @"Ghi chú riêng tư (Đã có)" : @"Thêm ghi chú riêng tư...",
-                                               hasNote ? @"note.text" : @"note.text.badge.plus",
-                                               session,
-                                               template);
-            if (a1) [customItems addObject:a1];
-            if (a2) [customItems addObject:a2];
-            if (a3) [customItems addObject:a3];
-            if (a4) [customItems addObject:a4];
-
-            if (isSectioned) {
-                if (customItems.count == 0) return origList;
-                NSMutableArray *sections = [origArray mutableCopy];
-                NSUInteger insertIdx = (sections.count > 1) ? (sections.count - 1) : sections.count;
-                [sections insertObject:[customItems copy] atIndex:insertIdx];
-                return [sections copy];
-            } else {
-                NSMutableArray *combined = [origArray mutableCopy];
-                [combined addObjectsFromArray:customItems];
-                return [combined copy];
-            }
-        })) {
-            installed++;
         }
     }
 
-    // 2. -contextMenu:didSelectActionId:forIdentifier: [v40@0:8@16q24@32]
-    SEL selectSel = sel_registerName("contextMenu:didSelectActionId:forIdentifier:");
-    if (ZLModClassHasInstanceMethod(mgrClass, selectSel)) {
-        IMP orig = class_getMethodImplementation(mgrClass, selectSel);
-        if (ZLModReplaceMethod(mgrClass, selectSel, 3, "v", ^(id selfObj, id menu, NSInteger actionId, id identifier) {
-            if (actionId >= kZLModActionToggleSeen && actionId <= kZLModActionPrivateNote) {
-                ZLModMenuSession *session = ZLModConsumeMenuSessionForIdentifier(menu ?: selfObj, identifier);
-                if (session) {
-                    ZLModExecuteMenuAction(actionId, session);
-                } else {
-                    ZLModShowToast(@"Phiên menu đã hết hạn — vui lòng thử lại");
-                }
-                return;
+    // Optional provider hook on builds using InboxContextMenuProvider
+    Class providerClass = NSClassFromString(@"InboxContextMenuProvider");
+    if (providerClass) {
+        SEL providerSel = sel_registerName("contextMenuSectionsForItem:info:");
+        if (ZLModClassHasInstanceMethod(providerClass, providerSel)) {
+            IMP orig = class_getMethodImplementation(providerClass, providerSel);
+            if (ZLModReplaceMethod(providerClass, providerSel, 2, "@", ^id(id selfObj, id item, id info) {
+                id origSections = orig ? ((id (*)(id, SEL, id, id))orig)(selfObj, providerSel, item, info) : nil;
+                if (![origSections isKindOfClass:[NSArray class]]) return origSections;
+                return ZLModAppendMenuActionsToArray(selfObj, item, (NSArray *)origSections);
+            })) {
+                installed++;
             }
-            if (orig) ((void (*)(id, SEL, id, NSInteger, id))orig)(selfObj, selectSel, menu, actionId, identifier);
-        })) {
-            installed++;
         }
     }
 
@@ -638,7 +595,6 @@ static NSUInteger ZLModInstallInboxContextMenuHooks(void) {
 static NSUInteger ZLModInstallInboxCellBadgeHooks(void) {
     NSUInteger installed = 0;
 
-    // 1. Legacy/standard UXInboxMessageCell (-setObject:, -prepareForReuse)
     Class uxCellCls = NSClassFromString(@"UXInboxMessageCell");
     if (uxCellCls) {
         SEL setObjSel = sel_registerName("setObject:");
@@ -665,7 +621,6 @@ static NSUInteger ZLModInstallInboxCellBadgeHooks(void) {
         }
     }
 
-    // 2. ZADesignSystem ChatListItemCell (-setListItem:, -prepareForReuse)
     Class zdsCellCls = NSClassFromString(@"ChatListItemCell");
     if (zdsCellCls) {
         SEL setListSel = sel_registerName("setListItem:");
@@ -699,23 +654,26 @@ void ZLModConversationMenuInstall(void) {
     NSUInteger menuHooks = ZLModInstallInboxContextMenuHooks();
     NSUInteger cellHooks = ZLModInstallInboxCellBadgeHooks();
 
-    [[NSNotificationCenter defaultCenter] addObserverForName:ZLModConversationPolicyDidChangeNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification *note) {
-        ZLModRefreshAllTrackedInboxCells();
-    }];
+    if (!gConversationMenuObserversInstalled) {
+        gConversationMenuObserversInstalled = YES;
+        [[NSNotificationCenter defaultCenter] addObserverForName:ZLModConversationPolicyDidChangeNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            ZLModRefreshAllTrackedInboxCells();
+        }];
 
-    [[NSNotificationCenter defaultCenter] addObserverForName:ZLModAccountDidChangeNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification *note) {
-        os_unfair_lock_lock(&gMenuSessionLock);
-        [gMenuSessions removeAllObjects];
-        gLatestMenuSession = nil;
-        os_unfair_lock_unlock(&gMenuSessionLock);
-        ZLModRefreshAllTrackedInboxCells();
-    }];
+        [[NSNotificationCenter defaultCenter] addObserverForName:ZLModAccountDidChangeNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            os_unfair_lock_lock(&gMenuSessionLock);
+            [gMenuSessions removeAllObjects];
+            gLatestMenuSession = nil;
+            os_unfair_lock_unlock(&gMenuSessionLock);
+            ZLModRefreshAllTrackedInboxCells();
+        }];
+    }
 
     ZLModSetModuleStatus(@"ConversationMenu",
                          (menuHooks >= 2) ? ZLModModuleStatusHookInstalled : ZLModModuleStatusNotInstalled,

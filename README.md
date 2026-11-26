@@ -1,90 +1,65 @@
-# ZLMod — Tùy biến Native cho Zalo iOS
+# ZLMod — Tùy biến Native cho Zalo iOS (4.0 / Build 11)
 
-Dylib độc lập chất lượng cao dành cho các bản Zalo được hỗ trợ chính xác (`261002/261002802` và `261101/261101802`; bundle `vn.com.vng.zingalo` hoặc `vn.com.vng.zingalo2`, arm64, iOS 15.1+):
-Tùy chỉnh giao diện, bảo vệ quyền riêng tư toàn cục & theo từng cuộc trò chuyện, chống thu hồi tin nhắn (Anti-Recall) mã hóa cục bộ với tính năng Hiện/Ẩn trực tiếp trong ô chat, tiện ích nhắn tin, chặn quảng cáo — tích hợp mượt mà theo phong cách native của iOS, mặc định tắt hoàn toàn khi mới cài đặt để bảo đảm an toàn tuyệt đối.
+Dylib độc lập (clean-room, pure `clang`, không Theos, không Cydia Substrate / ElleKit) dành cho Zalo iOS (`261002/261002802` và `261101/261101802` theo `Resources/compatibility.json`, kèm cơ chế xác minh 3-class runtime anchor quorum; bundle `vn.com.vng.zingalo` hoặc `vn.com.vng.zingalo2`, `arm64`, iOS 15.1+).
+
+Mọi tính năng đều **tắt mặc định (fail-safe OFF)** khi mới cài đặt, dữ liệu nhạy cảm được mã hóa cục bộ và tách biệt theo từng tài khoản (`accountScope`).
 
 ---
 
-## 1. Thành phần kiến trúc (Build 9)
+## 1. Thành phần kiến trúc (4.0 — Build 11, 21 module)
+
+Nguồn chân lý phiên bản duy nhất nằm tại `Resources/version.json` (tự sinh `Sources/ZLModVersionData.h` khi chạy `make`).
 
 | Module | Chức năng & Vai trò |
 |---|---|
-| `ZLModCore` | Khởi tạo, cô lập từng module, ring-buffer + file log có lọc dữ liệu nhạy cảm (redaction), theo dõi phiên đăng nhập/đăng xuất. |
-| `ZLModCompatibility` | Nhận diện phiên bản ứng dụng, kiểm tra exact build gate + xác minh tính toàn vẹn 84 anchors runtime. |
-| `ZLModPreferences` | Quản lý cấu hình (suite `com.zlmod.preferences` + mirror App Group `group.zsettings.vn.com.vng.zingalo` + nút khôi phục mặc định). |
-| `ZLModHookEngine` | Engine hook phương thức runtime (Objective-C runtime), kiểm tra nghiêm ngặt kiểu dữ liệu/arity/return type trước khi thay thế. |
-| `ZLModCryptoStore` | Hộp lưu trữ mã hóa chuẩn quân đội AES-256-CBC + HMAC-SHA256 v2 bằng khóa trong iOS Keychain, định danh `accountScope` (fail-closed). |
-| `ZLModPolicyStore` | Theo dõi ngữ cảnh chat đang mở + lưu chính sách Seen/Typing/Unread riêng biệt theo từng cuộc trò chuyện. |
-| `ZLModURIFilter` | Chặn các endpoint thu thập dữ liệu phân tích / tracking / quảng cáo ngay trong tiến trình (`NSURLProtocol`). |
-| `ZLModPrivacy` | Ẩn trạng thái đang nhập (typing), kiểm soát trạng thái đã xem (seen receipts) toàn cục & từng người, vô hiệu hóa Firebase Analytics. |
-| `ZLModConversationMenu` | Menu ngữ cảnh khi nhấn giữ hội thoại (`InboxContextMenuManager` - phân nhóm Section an toàn, chống crash) + chấm xanh chưa đọc độc lập. |
-| `ZLModAntiRecall` | Chống thu hồi tin nhắn: Lưu bản sao mã hóa cục bộ (14 ngày), nút **Hiện / Ẩn** trực tiếp ngay trong bong bóng chat, hỗ trợ ảnh chất lượng cao. |
-| `ZLModUtilities` | Ghi chú riêng tư mã hóa theo từng người, mẫu câu trả lời nhanh (chỉ điền vào khung soạn thảo), hoãn gửi tin nhắn (Delay Send Undo FSM 1-10s). |
-| `ZLModTheme` | Bộ theme màu (`classic_blue`, `dark_oled`, `pure_black`, `ocean_teal`) + màu nhấn `#HEX` tùy chỉnh, có lưu baseline khôi phục sạch. |
-| `ZLModAds` | Vô hiệu hóa và ẩn hoàn toàn các thành phần quảng cáo feed, OA quảng cáo. |
-| `ZLModFeatures` | Khôi phục Profile Music, Google Drive Backup, hiển thị More Tab. |
-| `ZLModSettings` | Mục cấu hình "ZLMod Customize" lồng ghép chuẩn native vào Cài đặt Zalo (clone `BasicSettingCellV2Object`). |
-| `ZLModUI` | Bảng điều khiển cài đặt trung tâm + 6 màn hình quản lý, nhật ký chẩn đoán chi tiết. |
-| `ZLModGlass` | Hiệu ứng Liquid Glass cho Tab Bar (tương thích iOS 15 - iOS 18+, loại trừ treo giao diện do Watchdog). |
+| `ZLModCore` | Khởi tạo 2 pha (Pha A: hook nền an toàn; Pha B: UIKit trên main thread), cô lập từng module (`@try/@catch`), ring-buffer 200 dòng + file log `ZLMod.log` có redaction (lọc Discord webhook, Bearer token, query secret, số 10+ chữ số), dọn trạng thái khi đăng nhập/đăng xuất. |
+| `ZLModCompatibility` | Bộ đánh giá thống nhất `ZLModEvaluateHostCompatibility`: ưu tiên exact target từ `Resources/compatibility.json`, fallback chỉ kích hoạt khi hội đủ 3 runtime anchor cốt lõi (`ZaloTabBarViewController`, `ChatDataManager`, `SettingUI40TableViewController`/`BasicSettingTableViewController`). |
+| `ZLModHookEngine` | Chỉ mục selector 1 lượt (`ZLModPrewarmSelectorIndex`), thay thế phương thức có kiểm chứng arity + return encoding, helper UIKit an toàn main thread (`ZLModTopPresenterViewController`, `ZLModIsAnyTextInputActive`). |
+| `ZLModChatEntityAdapter` | Chuẩn hóa đối tượng Zalo `ChatEntity` thành `ZLModMessageModel` bất biến: tự động chuẩn hóa timestamp giây/ms, nhận diện tin nhắn thu hồi theo cờ cấu trúc + khớp chính xác câu placeholder (không nhận nhầm chữ `"thu hồi"` trong tin nhắn thường), trích xuất ảnh & tiêu đề hội thoại. |
+| `ZLModCryptoStore` | Mã hóa `AES-256-CBC + HMAC-SHA256` (văn bản & nhị phân) dùng khóa 256-bit trong iOS Keychain (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`), `ZLModSecretStore` lưu bí mật (`Bridge Token`, `Discord Webhook`) hoàn toàn trong Keychain, báo cáo `ZLModStorageHealth`, hàng đợi ghi đĩa bất đồng bộ `zlmod.diskio`. |
+| `ZLModPreferences` | Cấu hình bền vững (suite `vn.com.vng.zingalo.zlmod` + mirror App Group `group.zsettings.vn.com.vng.zingalo`), di chuyển & xóa sạch bí mật plaintext cũ sang Keychain, cập nhật gom lô (`performBatchUpdates:`), allowlist chặt chẽ cho CDeploy (`remoteDeployAllowedKeys`). |
+| `ZLModOverlayUI` | Tiện ích main-thread (`ZLModRunOnMainThread`) & toast banner xếp hàng có hỗ trợ VoiceOver / Dynamic Type (tách khỏi `ConversationMenu`). |
+| `ZLModPolicyStore` | Ngăn xếp LIFO `ZLModPrivacyContext` an toàn khi mở chat lồng nhau + chính sách Seen/Typing/Unread theo tài khoản (schema v3 lưu `titleCipher` tên hội thoại thật). |
+| `ZLModURIFilter` | Chặn endpoint tracking & quảng cáo qua `NSURLProtocol`, đồng thời hook `NSURLSessionConfiguration` (`default` & `ephemeral`) và miễn trừ rõ host C-Bridge, Discord & WebSocket `Upgrade`. |
+| `ZLModPrivacy` | Ẩn trạng thái đang nhập, kiểm soát đã xem toàn cục & theo từng người, tắt/bật lại được Firebase Analytics/Performance/Crashlytics ngay lập tức. |
+| `ZLModConversationMenu` | Menu nhấn giữ hội thoại hỗ trợ cả `InboxContextMenuManager` & `InboxContextMenuProvider` (đóng gói Section chống crash + chống chèn trùng), chấm xanh chưa đọc cục bộ (`tag=0x5A1D`). |
+| `ZLModMessageTap` | Event bus `ZLModMessageTapBus` tách hoàn toàn `AntiRecall`, `CSaving` và `DiscordRelay`; khử trùng lặp LRU có giới hạn (1000 khóa, tách riêng `obs`/`recall`). |
+| `ZLModAntiRecall` | Chống thu hồi tin nhắn không sửa DB gốc: lưu bản sao chữ & ảnh mã hóa trên đĩa (`ZLModRecallPhotos`, quota 20 MB, TTL 14 ngày), sửa rò rỉ bộ nhớ `liveByKey` (`altKey`), dọn label khi tái sử dụng cell (`prepareForReuse`), nút **Hiện / Ẩn** trực tiếp trong ô chat & trình xem ảnh hỗ trợ pinch-to-zoom. |
+| `ZLModUtilities` | Ghi chú riêng tư mã hóa hỗ trợ nhiều dòng (`UITextView`) + tên hội thoại thật; Quick Reply theo từng tài khoản + nút chèn nhanh `⚡` trên thanh chat (không bao giờ tự gửi); Delay Send Undo FSM 5 trạng thái hỗ trợ đa tin nhắn, đếm ngược trực tiếp & tránh bàn phím. |
+| `ZLModTheme` | Điều phối giao diện hợp nhất `ZLModAppearanceCoordinator` (1 baseline duy nhất cho Theme & Blur Tab Bar), các preset màu và kiểm tra nghiêm ngặt mã `#RRGGBB`. |
+| `ZLModGlass` | Chất liệu mờ `UIBlurEffectStyleSystemUltraThinMaterial` cho Tab Bar phối hợp qua `ZLModAppearanceCoordinator` (không tham chiếu `UIGlassEffect` do Zalo dùng `UIDesignRequiresCompatibility=YES`). |
+| `ZLModAds` | Ẩn thành phần quảng cáo feed/OA và theo dõi bằng `NSHashTable` yếu để khôi phục hiển thị ngay khi tắt công tắc. |
+| `ZLModFeatures` | Khôi phục Profile Music, Google Drive Backup bridge và More Tab bằng chỉ mục selector 1 lượt. |
+| `ZLModSettings` | Chèn mục `ZLMod Customize` theo từng VC độc lập (không `memcpy`/`CFRetain`), nút dự phòng trên thanh điều hướng không lệch chỉ số bảng, cử chỉ lắc an toàn với iOS Undo Typing & có công tắc tắt. |
+| `ZLModBridge` | Máy khách C-Bridge: WebSocket FSM 4 trạng thái có `connectionEpoch` chống stale task, exponential backoff (`2s..30s`), heartbeat `20s` + pong timeout `10s`, quét máy chủ LAN qua Bonjour/mDNS, gửi token qua header `Authorization: Bearer`, CSaving độc lập giữ đúng thứ tự khi gửi lại, CDeploy allowlist + guaranteed `cdeploy_ack`, và **Discord Webhook Relay tự động** cho tin nhắn đến & tin bị thu hồi. |
+| `ZLModUI` | Bảng điều khiển trung tâm (`S01`) + 7 màn hình quản lý & chẩn đoán (`S02`–`S08`), banner cảnh báo `ZLModStorageHealth`, spinner tải, pull-to-refresh và hỗ trợ Dynamic Type / VoiceOver. |
 
 ---
 
-## 2. Tính năng nổi bật trong Build 9
+## 2. Đóng gói & Cài đặt IPA
 
-### 👁️ Chống thu hồi tin nhắn (Anti-Recall) — Khôi phục trực tiếp trong ô chat (In-Place Toggle)
-- Khi đối phương thu hồi tin nhắn, ZLMod đã tự động chụp snapshot và lưu bản sao mã hóa AES-256-CBC an toàn trong Keychain.
-- **Bấm "Hiện" (icon con mắt 👁):**
-  - Nhấn giữ vào ô *"Tin nhắn đã được thu hồi"*, menu ngữ cảnh sẽ xuất hiện nút **"Hiện"**.
-  - Bấm **"Hiện"**, nội dung tin nhắn sẽ lập tức **hiển thị trực tiếp ngay bên trong bong bóng chat** thay cho dòng thông báo thu hồi, bong bóng tự động co giãn theo văn bản.
-  - Đối với **Ảnh thu hồi**: Hiển thị nhãn phục hồi trong chat và tự động mở trình xem ảnh chất lượng cao cho phép phóng to, lưu về máy hoặc sao chép.
-- **Bấm "Ẩn" (icon con mắt gạch 👁‍🗨):**
-  - Sau khi đã hiện, nếu bạn nhấn giữ lại vào ô tin nhắn đó, nút sẽ đổi thành **"Ẩn"**. Bấm vào sẽ đưa ô chat trở lại trạng thái *"Tin nhắn đã được thu hồi"* như ban đầu.
-- **Hoàn toàn không can thiệp SQLite database gốc** của Zalo — an toàn tuyệt đối, không gây hỏng dữ liệu.
-
-### 🛡️ Menu ngữ cảnh hội thoại phân nhóm (Fix Crash triệt để)
-- Nhấn giữ vào bất kỳ cuộc trò chuyện nào trong danh sách tin nhắn để mở menu tùy chỉnh riêng:
-  1. **Bật/Tắt Ẩn đã xem với người này**
-  2. **Bật/Tắt Ẩn đang soạn tin với người này**
-  3. **Đánh dấu chưa đọc cục bộ (Chấm xanh `#0068FF`)**
-  4. **Ghi chú riêng tư (Mã hóa Keychain)**
-- **Khắc phục lỗi crash trong Build 8:** ZLMod Build 9 đóng gói các tùy chọn vào một Section độc lập chuẩn cấu trúc UIKit `NSArray<NSArray<ZAContextMenuAction *> *>`. Nhấn giữ mượt mà, phân nhóm ngăn nắp và không bị văng app.
-
-### 🫧 Liquid Glass Tab Bar (Chống đơ / Chống treo Watchdog)
-- Tối ưu hóa render phân luồng nền, giải quyết dứt điểm hiện tượng đơ app hoặc bị hệ thống ngắt tiến trình (`0x8BADF00D` Watchdog Timeout) khi bật hiệu ứng Liquid Glass.
+Pipeline Python trong `Packaging/` thực hiện:
+- `Packaging/macho_injector.py`: Tiêm `LC_RPATH` (`@executable_path/Frameworks`) và `LC_LOAD_DYLIB` (`@rpath/libZLMod.dylib`) với kiểm tra bắt buộc căn chỉnh **8-byte** cho mọi load command và `sizeofcmds` trên Mach-O 64-bit arm64.
+- `Packaging/package_ipa.py`: Đóng gói bản **Full** (giữ extensions, phù hợp TrollStore / Apple Developer trả phí) và bản **No-Appex** (`--no-appex`, chỉ dùng 1 App ID, khuyến nghị cho Sideloadly / AltStore / SideStore / xtool với Apple ID miễn phí).
+- `Packaging/ipa_preflight.py`: Kiểm tra tiền bay IPA (cryptid=0, tương thích, căn chỉnh 8-byte, và phân loại đầy đủ 5 trạng thái chữ ký kể cả thiếu `embedded.mobileprovision` hoặc thiếu `_CodeSignature/CodeResources`).
 
 ---
 
-## 3. Hướng dẫn cài đặt & Sideload
-
-### Các bản IPA cung cấp sẵn trong thư mục `dist/`:
-1. **Bản khuyến nghị:** `Zalo-26.10.02-ZLMod-build9-noappex-unsigned.ipa` (130 MB)
-   - Đã loại bỏ toàn bộ App Extension (Share, Siri, Notification Service...) để chỉ cần **duy nhất 1 App ID**.
-   - Phù hợp nhất cho **xtool**, **Sideloadly**, **AltStore** khi dùng tài khoản Apple ID miễn phí.
-2. **Bản đầy đủ:** `Zalo-26.10.02-ZLMod-build9-unsigned.ipa` (140 MB)
-   - Giữ nguyên toàn bộ extension, dành cho chứng chỉ Doanh nghiệp / Nhà phát triển trả phí hoặc cài qua **TrollStore**.
-
-### Quy trình cài đặt chuẩn (Tránh lỗi "Không thể cài đặt app"):
-1. **Xóa bản Zalo ZLMod cũ:** Nếu trên màn hình đã có bản ZLMod trước đó, hãy nhấn giữ và Xóa app trước khi cài bản mới để tránh xung đột chữ ký/container.
-2. **Ký và nạp vào máy:**
-   - Dùng **xtool** hoặc **Sideloadly** trên máy tính: Cắm cáp iPhone, kéo file `build9-noappex-unsigned.ipa` vào, nhập Apple ID và bấm Start.
-   - Hoặc cài trực tiếp bằng **TrollStore** nếu máy hỗ trợ.
-3. **Mở app và cấp quyền tin cậy:** Vào *Cài đặt iPhone → Cài đặt chung → Quản lý VPN & Thiết bị* để Tin cậy nhà phát triển.
-
----
-
-## 4. Biên dịch & Kiểm thử
+## 3. Biên dịch & Kiểm thử
 
 ```bash
-# Kiểm thử hợp đồng portable trên mọi hệ điều hành (Python 3):
-python -m unittest discover -s Tests -p "test_*.py" -v
-python Scripts/project_gate.py .
+# 1. Kiểm thử portable trên mọi hệ điều hành (Python 3):
+python3 -m unittest discover -s Tests -p "test_*.py" -v
+python3 Scripts/project_gate.py .
+python3 Packaging/ipa_preflight.py Decrypted/<decrypted.ipa> --require-unencrypted-main
 
-# Biên dịch dylib trên macOS (Xcode iphoneos SDK):
-make
-make gates    # Xác minh arm64, dependencies sạch, minos 15.1, UIGlassEffect runtime guard
+# 2. Biên dịch dylib & kiểm định cổng tĩnh trên macOS (Xcode iphoneos SDK):
+make          # Tự chạy Scripts/generate_compatibility.py & Scripts/generate_version.py
+make gates    # Xác minh arm64, dependencies sạch, minos 15.1, codesign
 ```
 
 ---
 
-## 5. Ranh giới an toàn kỹ thuật (Clean-Room Boundary)
-ZLMod được thiết kế độc lập theo chuẩn công nghệ sạch (Clean-room engineering), không sử dụng Theos, Cydia Substrate, Substitute hay ElleKit. Các tính năng vi phạm chính sách máy chủ như vượt giới hạn dung lượng tải lên, gian lận quyền Admin nhóm, hoặc bẻ khóa ZCloud Premium cố ý không được triển khai vì do máy chủ Zalo quyết định (Server-authoritative).
+## 4. Ranh giới an toàn kỹ thuật (Clean-Room Boundary)
+
+ZLMod được thiết kế độc lập theo chuẩn clean-room, chỉ liên kết `UIKit`, `Foundation`, `QuartzCore`, `Security`. Các tính năng do máy chủ Zalo quyết định (ZCloud Premium, quyền Admin nhóm, vượt giới hạn dung lượng / TTL máy chủ) cố ý không được triển khai.

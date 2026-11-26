@@ -30,7 +30,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from macho_injector import get_load_dylibs, inject_load_dylib, inject_rpath
+from macho_injector import get_load_dylibs, inject_load_dylib, inject_rpath, verify_macho_alignment
 
 COMPATIBILITY_MANIFEST = PROJECT_ROOT / "Resources" / "compatibility.json"
 DEFAULT_DYLIB = PROJECT_ROOT / "build" / "libZLMod.dylib"
@@ -327,13 +327,14 @@ def validate_ipa(ipa_path: Path, dylib_name: str, expected_bundle_id: str, expec
         assert dylib_in_ipa in namelist, f"{dylib_in_ipa} not found in IPA archive!"
         print(f"[Forensics] Embedded dylib verified: {dylib_in_ipa} ({zf.getinfo(dylib_in_ipa).file_size:,} bytes)")
 
-        # 3. Main executable load command check
+        # 3. Main executable load command & Mach-O 8-byte alignment check
         assert main_bin_path in namelist, f"Main executable missing: {main_bin_path}"
         main_bin_data = zf.read(main_bin_path)
+        verify_macho_alignment(main_bin_data)
         load_dylibs = get_load_dylibs(main_bin_data)
         expected_load = f"@rpath/{dylib_name}"
         assert expected_load in load_dylibs, f"Load command '{expected_load}' not found in {exec_name} executable!"
-        print(f"[Forensics] Load command verified in {exec_name}: {expected_load}")
+        print(f"[Forensics] Load command & 8-byte Mach-O alignment verified in {exec_name}: {expected_load}")
 
         # 4. Mach-O Cryptid check across all binaries (main app + extensions + frameworks + dylib)
         macho_count = 0

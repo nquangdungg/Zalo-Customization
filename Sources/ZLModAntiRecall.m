@@ -1,7 +1,12 @@
 // language: Objective-C, file: ZLModAntiRecall.m, target: iOS 15.1+ (Zalo 26.10.02 & 26.11.01, arm64)
-// Local-only Anti-Recall Ghost Preview with Keychain-backed AES-256-CBC + HMAC-SHA256
-// storage, 14-day TTL pruning, account-scope isolation, and explicit local-copy labeling.
-// Never mutates Zalo's SQLite database or ChatEntity.message property.
+// Local-only Anti-Recall Ghost Preview (MODULE 07):
+//   - Consumes normalized events from decoupled ZLModMessageTapBus (CSaving no longer depends on Anti-Recall).
+//   - Leak-free live snapshot LRU (evicts BOTH primaryKey and altKey atomically).
+//   - Keychain-backed AES-256-CBC + HMAC-SHA256 storage for BOTH recalled text AND recalled photos on disk
+//     (survives app restarts within 20 MB LRU quota & 14-day TTL) using non-blocking async I/O.
+//   - Strictly non-mutating: NEVER mutates Zalo's SQLite database or host chat entity message setters.
+//   - Structured recalled detection via ZLModChatEntityAdapter (no false positives on messages containing "thu hồi").
+//   - Cleans associated label state on UITableViewCell / UICollectionViewCell prepareForReuse.
 
 #import "ZLMod.h"
 #import <os/lock.h>
@@ -9,19 +14,20 @@
 
 NSString *const ZLModAntiRecallNoticePrefix = @"[ZLMod Bản sao cục bộ — tin nhắn gốc đã thu hồi]";
 
-static const NSTimeInterval kZLModAntiRecallTTLSeconds = 14.0 * 86400.0;
-static const NSUInteger kZLModMaxPersistedRecalls = 300;
-static const NSUInteger kZLModMaxLiveSnapshots = 400;
+static const char * const kZLModOrigRecallTextKey = "ZLModOrigRecallText";
 
 @interface ZLModLiveMessageSnapshot : NSObject
 @property (nonatomic, assign) int64_t globalId;
 @property (nonatomic, assign) int64_t clientId;
 @property (nonatomic, copy) NSString *accountScope;
+@property (nonatomic, copy) NSString *primaryKey;
+@property (nonatomic, copy) NSString *altKey;
 @property (nonatomic, copy) NSString *message;
 @property (nonatomic, copy) NSString *senderName;
 @property (nonatomic, copy) NSString *senderId;
 @property (nonatomic, copy) NSString *threadId;
 @property (nonatomic, assign) NSTimeInterval timestamp;
+@property (nonatomic, strong) NSData *cachedPhotoJPEG;
 @end
 
 @implementation ZLModLiveMessageSnapshot
@@ -34,8 +40,9 @@ static void ZLModClearUnhiddenMessages(void);
 }
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *records;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ZLModLiveMessageSnapshot *> *liveByKey;
-@property (nonatomic, strong) NSMutableArray<NSString *> *liveOrder;
+@property (nonatomic, strong) NSMutableArray<ZLModLiveMessageSnapshot *> *liveOrder;
 @property (nonatomic, copy) NSString *storagePath;
+@property (nonatomic, copy) NSString *photoDirectoryPath;
 @end
 
 @implementation ZLModAntiRecallStore
@@ -60,9 +67,10 @@ static void ZLModClearUnhiddenMessages(void);
         NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         NSString *docs = paths.firstObject ?: NSTemporaryDirectory();
         _storagePath = [docs stringByAppendingPathComponent:@"ZLModAntiRecall.plist"];
+        _photoDirectoryPath = [docs stringByAppendingPathComponent:@"ZLModRecallPhotos"];
 
         [self loadFromDiskLocked];
-        [self pruneExpiredLockedAndPersist:YES];
+        [self pruneExpiredEntries];
 
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
@@ -92,7 +100,8 @@ static void ZLModClearUnhiddenMessages(void);
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *note) {
-            if ([note.object isEqualToString:kZLModAntiRecall] || [note.object isEqualToString:@"*"]) {
+            NSString *k = [note.object isKindOfClass:[NSString class]] ? (NSString *)note.object : @"";
+            if ([k isEqualToString:kZLModAntiRecall] || [k isEqualToString:@"*"]) {
                 if (![[ZLModPreferences shared] boolForKey:kZLModAntiRecall]) {
                     [self purgeLiveSnapshots];
                     ZLModClearUnhiddenMessages();
@@ -139,7 +148,17 @@ static void ZLModClearUnhiddenMessages(void);
     return [meta copy];
 }
 
-#pragma mark - Disk persistence
++ (NSData *)photoMetadataForAccountScope:(NSString *)scope key:(NSString *)recordKey {
+    NSString *bound = [NSString stringWithFormat:@"ZLModRecallPhoto.v2|%@|%@", scope ?: @"", recordKey ?: @""];
+    return [bound dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+- (NSString *)photoFilePathForFileName:(NSString *)fileName {
+    if (fileName.length == 0) return nil;
+    return [self.photoDirectoryPath stringByAppendingPathComponent:fileName];
+}
+
+#pragma mark - Disk persistence (non-blocking async writes outside lock)
 
 - (void)loadFromDiskLocked {
     if (![[NSFileManager defaultManager] fileExistsAtPath:self.storagePath]) return;
@@ -153,7 +172,7 @@ static void ZLModClearUnhiddenMessages(void);
         if (![plist isKindOfClass:[NSDictionary class]]) return;
         NSNumber *ver = plist[@"version"];
         NSDictionary *stored = plist[@"records"];
-        if (![ver isKindOfClass:[NSNumber class]] || ver.integerValue != 2 ||
+        if (![ver isKindOfClass:[NSNumber class]] || (ver.integerValue != 2 && ver.integerValue != 3) ||
             ![stored isKindOfClass:[NSDictionary class]]) {
             return;
         }
@@ -167,28 +186,69 @@ static void ZLModClearUnhiddenMessages(void);
     }
 }
 
-- (BOOL)persistLocked {
-    NSDictionary *root = @{
+- (NSDictionary *)immutableSnapshotLocked {
+    return @{
         @"version": @2,
         @"records": [self.records copy]
     };
-    NSError *error = nil;
-    NSData *data = [NSPropertyListSerialization dataWithPropertyList:root
-                                                              format:NSPropertyListBinaryFormat_v1_0
-                                                             options:0
-                                                               error:&error];
-    if (!data || error) return NO;
-    return [data writeToFile:self.storagePath options:NSDataWritingAtomic error:&error];
 }
 
-- (void)pruneExpiredLockedAndPersist:(BOOL)shouldPersist {
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    NSMutableArray<NSString *> *expiredKeys = [NSMutableArray array];
+- (void)deletePhotoFilesAsync:(NSArray<NSString *> *)fileNames {
+    if (fileNames.count == 0) return;
+    NSString *dir = [self.photoDirectoryPath copy];
+    NSArray<NSString *> *copyNames = [fileNames copy];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *name in copyNames) {
+            if (name.length == 0) continue;
+            [fm removeItemAtPath:[dir stringByAppendingPathComponent:name] error:nil];
+        }
+    });
+}
 
+- (void)enforcePhotoQuotaAsync {
+    NSString *dir = [self.photoDirectoryPath copy];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+        if (files.count == 0) return;
+
+        NSMutableArray<NSDictionary *> *metaList = [NSMutableArray array];
+        unsigned long long totalBytes = 0;
+        for (NSString *name in files) {
+            NSString *full = [dir stringByAppendingPathComponent:name];
+            NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+            unsigned long long sz = [attrs fileSize];
+            NSDate *mtime = attrs[NSFileModificationDate] ?: [NSDate distantPast];
+            totalBytes += sz;
+            [metaList addObject:@{ @"path": full, @"size": @(sz), @"mtime": mtime }];
+        }
+        if (totalBytes <= kZLModAntiRecallMaxPhotoBytes) return;
+
+        [metaList sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [a[@"mtime"] compare:b[@"mtime"]];
+        }];
+        for (NSDictionary *item in metaList) {
+            if (totalBytes <= kZLModAntiRecallMaxPhotoBytes) break;
+            [fm removeItemAtPath:item[@"path"] error:nil];
+            totalBytes -= [item[@"size"] unsignedLongLongValue];
+        }
+    });
+}
+
+- (void)pruneExpiredEntries {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSDictionary *snapshot = nil;
+    NSMutableArray<NSString *> *photosToDelete = [NSMutableArray array];
+
+    os_unfair_lock_lock(&_lock);
+    NSMutableArray<NSString *> *expiredKeys = [NSMutableArray array];
     [self.records enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSDictionary *entry, __unused BOOL *stop) {
         NSTimeInterval savedAt = [entry[@"savedAt"] doubleValue];
         if (savedAt <= 0 || (now - savedAt) > kZLModAntiRecallTTLSeconds) {
             [expiredKeys addObject:key];
+            NSString *pf = entry[@"photoFile"];
+            if ([pf isKindOfClass:[NSString class]] && pf.length > 0) [photosToDelete addObject:pf];
         }
     }];
 
@@ -198,29 +258,43 @@ static void ZLModClearUnhiddenMessages(void);
         mutated = YES;
     }
 
-    if (self.records.count > kZLModMaxPersistedRecalls) {
-        NSArray<NSString *> *sortedKeys = [self.records keysSortedByValueUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-            return [a[@"savedAt"] compare:b[@"savedAt"]];
+    // Cap per account (kZLModAntiRecallMaxRecordsPerAcc)
+    NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *byScope = [NSMutableDictionary dictionary];
+    [self.records enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSDictionary *entry, __unused BOOL *stop) {
+        NSString *sc = [entry[@"accountScope"] isKindOfClass:[NSString class]] ? entry[@"accountScope"] : @"_";
+        if (!byScope[sc]) byScope[sc] = [NSMutableArray array];
+        [byScope[sc] addObject:key];
+    }];
+    for (NSString *sc in byScope) {
+        NSMutableArray<NSString *> *keys = byScope[sc];
+        if (keys.count <= kZLModAntiRecallMaxRecordsPerAcc) continue;
+        [keys sortUsingComparator:^NSComparisonResult(NSString *ka, NSString *kb) {
+            return [(self.records[ka][@"savedAt"] ?: @0) compare:(self.records[kb][@"savedAt"] ?: @0)];
         }];
-        NSUInteger excess = self.records.count - kZLModMaxPersistedRecalls;
-        for (NSUInteger i = 0; i < excess && i < sortedKeys.count; i++) {
-            [self.records removeObjectForKey:sortedKeys[i]];
+        NSUInteger excess = keys.count - kZLModAntiRecallMaxRecordsPerAcc;
+        for (NSUInteger i = 0; i < excess; i++) {
+            NSString *dropKey = keys[i];
+            NSString *pf = self.records[dropKey][@"photoFile"];
+            if ([pf isKindOfClass:[NSString class]] && pf.length > 0) [photosToDelete addObject:pf];
+            [self.records removeObjectForKey:dropKey];
         }
         mutated = YES;
     }
 
-    if (mutated && shouldPersist) {
-        [self persistLocked];
+    if (mutated) {
+        snapshot = [self immutableSnapshotLocked];
+    }
+    os_unfair_lock_unlock(&_lock);
+
+    if (snapshot) {
+        ZLModWritePropertyListAsync(snapshot, self.storagePath, nil);
+    }
+    if (photosToDelete.count > 0) {
+        [self deletePhotoFilesAsync:photosToDelete];
     }
 }
 
-- (void)pruneExpiredEntries {
-    os_unfair_lock_lock(&_lock);
-    [self pruneExpiredLockedAndPersist:YES];
-    os_unfair_lock_unlock(&_lock);
-}
-
-#pragma mark - Live in-memory snapshot cache (bounded, purged on disable/background)
+#pragma mark - Leak-Free Live Snapshot LRU (evicts BOTH primaryKey and altKey)
 
 - (void)purgeLiveSnapshots {
     os_unfair_lock_lock(&_lock);
@@ -229,44 +303,64 @@ static void ZLModClearUnhiddenMessages(void);
     os_unfair_lock_unlock(&_lock);
 }
 
-- (void)cacheLiveSnapshotWithGlobalId:(int64_t)globalId
-                             clientId:(int64_t)clientId
-                              message:(NSString *)message
-                           senderName:(NSString *)senderName
-                             senderId:(NSString *)senderId
-                             threadId:(NSString *)threadId
-                            timestamp:(NSTimeInterval)timestamp {
+- (void)cacheLiveSnapshotFromModel:(ZLModMessageModel *)model photoImage:(UIImage *)photoImage {
     if (![[ZLModPreferences shared] boolForKey:kZLModAntiRecall]) return;
-    if (![message isKindOfClass:[NSString class]] || message.length == 0) return;
-    if ([message hasPrefix:ZLModAntiRecallNoticePrefix]) return;
+    if (!model || model.isRecalled) return;
+    if (model.text.length == 0 && !photoImage) return;
+    if ([model.text hasPrefix:ZLModAntiRecallNoticePrefix]) return;
+    if ([ZLModChatEntityAdapter isPlaceholderRecalledText:model.text]) return;
 
-    NSString *scope = ZLModCurrentAccountScope();
-    NSString *primaryKey = [[self class] primaryKeyForAccountScope:scope globalId:globalId clientId:clientId];
+    NSString *scope = model.accountScope.length > 0 ? model.accountScope : ZLModCurrentAccountScope();
+    NSString *primaryKey = [[self class] primaryKeyForAccountScope:scope globalId:model.globalId clientId:model.clientId];
     if (!primaryKey) return;
 
+    NSString *altKey = (model.globalId > 0 && model.clientId > 0)
+        ? [NSString stringWithFormat:@"%@:c_%lld", scope, (long long)model.clientId]
+        : nil;
+
+    NSData *jpegData = photoImage ? UIImageJPEGRepresentation(photoImage, 0.82) : nil;
+
     ZLModLiveMessageSnapshot *snap = [[ZLModLiveMessageSnapshot alloc] init];
-    snap.globalId = globalId;
-    snap.clientId = clientId;
+    snap.globalId = model.globalId;
+    snap.clientId = model.clientId;
     snap.accountScope = scope;
-    snap.message = message;
-    snap.senderName = senderName ?: @"";
-    snap.senderId = senderId ?: @"";
-    snap.threadId = threadId ?: @"";
-    snap.timestamp = (timestamp > 0) ? timestamp : [[NSDate date] timeIntervalSince1970];
+    snap.primaryKey = primaryKey;
+    snap.altKey = altKey;
+    snap.message = model.text ?: @"";
+    snap.senderName = model.senderName ?: @"";
+    snap.senderId = model.senderId ?: @"";
+    snap.threadId = model.threadId ?: @"";
+    snap.timestamp = model.timestampSec;
+    snap.cachedPhotoJPEG = jpegData;
 
     os_unfair_lock_lock(&_lock);
-    if (!self.liveByKey[primaryKey]) {
-        [self.liveOrder addObject:primaryKey];
+    ZLModLiveMessageSnapshot *existing = self.liveByKey[primaryKey];
+    if (existing) {
+        [self.liveOrder removeObjectIdenticalTo:existing];
+        if (existing.altKey.length > 0 && ![existing.altKey isEqualToString:altKey]) {
+            [self.liveByKey removeObjectForKey:existing.altKey];
+        }
+        if (!snap.cachedPhotoJPEG && existing.cachedPhotoJPEG) {
+            snap.cachedPhotoJPEG = existing.cachedPhotoJPEG;
+        }
     }
     self.liveByKey[primaryKey] = snap;
-    if (globalId > 0 && clientId > 0) {
-        NSString *altKey = [NSString stringWithFormat:@"%@:c_%lld", scope, (long long)clientId];
+    if (altKey.length > 0) {
         self.liveByKey[altKey] = snap;
     }
-    while (self.liveOrder.count > kZLModMaxLiveSnapshots) {
-        NSString *oldest = self.liveOrder.firstObject;
+    [self.liveOrder addObject:snap];
+
+    while (self.liveOrder.count > kZLModAntiRecallMaxLiveSnapshots) {
+        ZLModLiveMessageSnapshot *oldest = self.liveOrder.firstObject;
         [self.liveOrder removeObjectAtIndex:0];
-        if (oldest) [self.liveByKey removeObjectForKey:oldest];
+        if (oldest) {
+            if (oldest.primaryKey.length > 0 && self.liveByKey[oldest.primaryKey] == oldest) {
+                [self.liveByKey removeObjectForKey:oldest.primaryKey];
+            }
+            if (oldest.altKey.length > 0 && self.liveByKey[oldest.altKey] == oldest) {
+                [self.liveByKey removeObjectForKey:oldest.altKey];
+            }
+        }
     }
     os_unfair_lock_unlock(&_lock);
 }
@@ -287,7 +381,7 @@ static void ZLModClearUnhiddenMessages(void);
     return snap;
 }
 
-#pragma mark - Encrypted recalled record persistence & lookup
+#pragma mark - Encrypted recalled text + photo persistence
 
 - (BOOL)saveSnapshotWithGlobalId:(int64_t)globalId
                         clientId:(int64_t)clientId
@@ -296,6 +390,65 @@ static void ZLModClearUnhiddenMessages(void);
                         senderId:(NSString *)senderId
                         threadId:(NSString *)threadId
                        timestamp:(NSTimeInterval)timestamp {
+    return [self saveEncryptedRecordWithGlobalId:globalId
+                                        clientId:clientId
+                                         message:message
+                                      senderName:senderName
+                                        senderId:senderId
+                                        threadId:threadId
+                                       timestamp:timestamp
+                                       photoJPEG:nil];
+}
+
+- (BOOL)saveSnapshotFromModel:(ZLModMessageModel *)model photoImage:(UIImage *)photoImage {
+    if (!model) return NO;
+    NSString *scope = model.accountScope.length > 0 ? model.accountScope : ZLModCurrentAccountScope();
+    ZLModLiveMessageSnapshot *cached = [self liveSnapshotForAccountScope:scope
+                                                                globalId:model.globalId
+                                                                clientId:model.clientId];
+
+    NSString *msg = cached.message;
+    if (msg.length == 0 && model.originRecallText.length > 0 &&
+        ![ZLModChatEntityAdapter isPlaceholderRecalledText:model.originRecallText]) {
+        msg = model.originRecallText;
+    }
+    if (msg.length == 0 && model.text.length > 0 &&
+        ![ZLModChatEntityAdapter isPlaceholderRecalledText:model.text]) {
+        msg = model.text;
+    }
+
+    NSData *photoJPEG = cached.cachedPhotoJPEG;
+    if (!photoJPEG && photoImage) {
+        photoJPEG = UIImageJPEGRepresentation(photoImage, 0.82);
+    }
+    if (msg.length == 0 && photoJPEG.length > 0) {
+        msg = @"[Hình ảnh đã thu hồi]";
+    }
+    if (msg.length == 0) return NO;
+
+    NSString *sName = cached.senderName.length > 0 ? cached.senderName : model.senderName;
+    NSString *sId = cached.senderId.length > 0 ? cached.senderId : model.senderId;
+    NSString *tid = cached.threadId.length > 0 ? cached.threadId : model.threadId;
+    NSTimeInterval ts = (cached.timestamp > 0) ? cached.timestamp : model.timestampSec;
+
+    return [self saveEncryptedRecordWithGlobalId:model.globalId
+                                        clientId:model.clientId
+                                         message:msg
+                                      senderName:sName
+                                        senderId:sId
+                                        threadId:tid
+                                       timestamp:ts
+                                       photoJPEG:photoJPEG];
+}
+
+- (BOOL)saveEncryptedRecordWithGlobalId:(int64_t)globalId
+                               clientId:(int64_t)clientId
+                                message:(NSString *)message
+                             senderName:(NSString *)senderName
+                               senderId:(NSString *)senderId
+                               threadId:(NSString *)threadId
+                              timestamp:(NSTimeInterval)timestamp
+                              photoJPEG:(NSData *)photoJPEG {
     if (![message isKindOfClass:[NSString class]] || message.length == 0) return NO;
     if ([message hasPrefix:ZLModAntiRecallNoticePrefix]) return NO;
 
@@ -317,7 +470,21 @@ static void ZLModClearUnhiddenMessages(void);
     NSData *cipher = [[ZLModCryptoBox shared] encryptString:payloadText metadata:metadata];
     if (!cipher) return NO;
 
-    NSDictionary *record = @{
+    // Optional encrypted photo persistence to disk (survives restart!)
+    NSString *photoFileName = nil;
+    NSData *encryptedPhoto = nil;
+    if (photoJPEG.length > 0) {
+        NSData *photoMeta = [[self class] photoMetadataForAccountScope:scope key:key];
+        encryptedPhoto = [[ZLModCryptoBox shared] encryptData:photoJPEG metadata:photoMeta];
+        if (encryptedPhoto.length > 0) {
+            NSString *fileHash = ZLModSha256Hex(key);
+            if (fileHash.length >= 24) {
+                photoFileName = [NSString stringWithFormat:@"%@.enc", [fileHash substringToIndex:24]];
+            }
+        }
+    }
+
+    NSMutableDictionary *record = [NSMutableDictionary dictionaryWithDictionary:@{
         @"accountScope": scope,
         @"globalId": @(globalId),
         @"clientId": @(clientId),
@@ -327,36 +494,46 @@ static void ZLModClearUnhiddenMessages(void);
         @"msgTimestamp": @(quantizedTs),
         @"savedAt": @([[NSDate date] timeIntervalSince1970]),
         @"cipher": cipher
-    };
-
-    BOOL saved = NO;
-    os_unfair_lock_lock(&_lock);
-    NSDictionary *prev = self.records[key];
-    self.records[key] = record;
-    [self pruneExpiredLockedAndPersist:NO];
-    saved = [self persistLocked];
-    if (!saved) {
-        if (prev) {
-            self.records[key] = prev;
-        } else {
-            [self.records removeObjectForKey:key];
-        }
+    }];
+    if (photoFileName.length > 0) {
+        record[@"photoFile"] = photoFileName;
     }
+
+    NSDictionary *snapshot = nil;
+    os_unfair_lock_lock(&_lock);
+    self.records[key] = [record copy];
+    snapshot = [self immutableSnapshotLocked];
     os_unfair_lock_unlock(&_lock);
-    return saved;
+
+    if (encryptedPhoto.length > 0 && photoFileName.length > 0) {
+        NSString *photoPath = [self photoFilePathForFileName:photoFileName];
+        ZLModWriteDataAsync(encryptedPhoto, photoPath, ^(__unused BOOL ok) {
+            [self enforcePhotoQuotaAsync];
+        });
+    }
+    ZLModWritePropertyListAsync(snapshot, self.storagePath, nil);
+    [self pruneExpiredEntries];
+    return YES;
 }
 
 - (NSDictionary *)recordLockedForAccountScope:(NSString *)scope
                                      globalId:(int64_t)globalId
-                                     clientId:(int64_t)clientId {
+                                     clientId:(int64_t)clientId
+                                       outKey:(NSString **)outKey {
     if (scope.length == 0) return nil;
     if (globalId > 0) {
         NSString *gKey = [NSString stringWithFormat:@"%@:g_%lld", scope, (long long)globalId];
-        if (self.records[gKey]) return self.records[gKey];
+        if (self.records[gKey]) {
+            if (outKey) *outKey = gKey;
+            return self.records[gKey];
+        }
     }
     if (clientId > 0) {
         NSString *cKey = [NSString stringWithFormat:@"%@:c_%lld", scope, (long long)clientId];
-        if (self.records[cKey]) return self.records[cKey];
+        if (self.records[cKey]) {
+            if (outKey) *outKey = cKey;
+            return self.records[cKey];
+        }
     }
     if (globalId > 0 || clientId > 0) {
         NSString *prefix = [scope stringByAppendingString:@":"];
@@ -366,6 +543,7 @@ static void ZLModClearUnhiddenMessages(void);
             int64_t rGid = [rec[@"globalId"] longLongValue];
             int64_t rCid = [rec[@"clientId"] longLongValue];
             if ((globalId > 0 && rGid == globalId) || (clientId > 0 && rCid == clientId)) {
+                if (outKey) *outKey = k;
                 return rec;
             }
         }
@@ -409,7 +587,7 @@ static void ZLModClearUnhiddenMessages(void);
     if (scope.length == 0) return nil;
 
     os_unfair_lock_lock(&_lock);
-    NSDictionary *rec = [self recordLockedForAccountScope:scope globalId:globalId clientId:clientId];
+    NSDictionary *rec = [self recordLockedForAccountScope:scope globalId:globalId clientId:clientId outKey:nil];
     os_unfair_lock_unlock(&_lock);
 
     return [self decryptMessageFromRecord:rec expectedScope:scope];
@@ -419,6 +597,36 @@ static void ZLModClearUnhiddenMessages(void);
     NSString *text = [self recalledTextForGlobalId:globalId clientId:clientId];
     if (text.length == 0) return nil;
     return [NSString stringWithFormat:@"%@ %@", ZLModAntiRecallNoticePrefix, text];
+}
+
+- (UIImage *)preservedPhotoForGlobalId:(int64_t)globalId clientId:(int64_t)clientId {
+    NSString *scope = ZLModCurrentAccountScope();
+    if (scope.length == 0) return nil;
+
+    // 1. Live snapshot photo in RAM
+    ZLModLiveMessageSnapshot *live = [self liveSnapshotForAccountScope:scope globalId:globalId clientId:clientId];
+    if (live.cachedPhotoJPEG.length > 0) {
+        UIImage *img = [UIImage imageWithData:live.cachedPhotoJPEG];
+        if (img) return img;
+    }
+
+    // 2. Encrypted photo persisted on disk (survives app restarts)
+    NSString *recKey = nil;
+    os_unfair_lock_lock(&_lock);
+    NSDictionary *rec = [self recordLockedForAccountScope:scope globalId:globalId clientId:clientId outKey:&recKey];
+    os_unfair_lock_unlock(&_lock);
+
+    NSString *photoFile = [rec[@"photoFile"] isKindOfClass:[NSString class]] ? rec[@"photoFile"] : nil;
+    if (photoFile.length == 0 || recKey.length == 0) return nil;
+
+    NSString *path = [self photoFilePathForFileName:photoFile];
+    NSData *enc = [NSData dataWithContentsOfFile:path];
+    if (enc.length == 0) return nil;
+
+    NSData *photoMeta = [[self class] photoMetadataForAccountScope:scope key:recKey];
+    NSData *plainJPEG = [[ZLModCryptoBox shared] decryptRawData:enc metadata:photoMeta];
+    if (plainJPEG.length == 0) return nil;
+    return [UIImage imageWithData:plainJPEG];
 }
 
 #pragma mark - History inspection & clearing
@@ -435,12 +643,14 @@ static void ZLModClearUnhiddenMessages(void);
         if (![key hasPrefix:prefix]) return;
         NSTimeInterval savedAt = [rec[@"savedAt"] doubleValue];
         if (savedAt <= 0 || (now - savedAt) > kZLModAntiRecallTTLSeconds) return;
+        BOOL hasPhoto = ([rec[@"photoFile"] isKindOfClass:[NSString class]] && [(NSString *)rec[@"photoFile"] length] > 0);
         [list addObject:@{
             @"key": key,
             @"globalId": rec[@"globalId"] ?: @0,
             @"clientId": rec[@"clientId"] ?: @0,
             @"threadHash": rec[@"threadHash"] ?: @"none",
             @"senderHash": rec[@"senderHash"] ?: @"none",
+            @"hasPhoto": @(hasPhoto),
             @"savedAt": @(savedAt),
             @"msgTimestamp": rec[@"msgTimestamp"] ?: @(savedAt)
         }];
@@ -490,7 +700,20 @@ static void ZLModClearUnhiddenMessages(void);
 }
 
 - (NSUInteger)preservedCountForCurrentAccount {
-    return [self entriesForCurrentAccount].count;
+    NSString *scope = ZLModCurrentAccountScope();
+    if (scope.length == 0) return 0;
+    NSString *prefix = [scope stringByAppendingString:@":"];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+
+    __block NSUInteger count = 0;
+    os_unfair_lock_lock(&_lock);
+    [self.records enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSDictionary *rec, __unused BOOL *stop) {
+        if (![key hasPrefix:prefix]) return;
+        NSTimeInterval savedAt = [rec[@"savedAt"] doubleValue];
+        if (savedAt > 0 && (now - savedAt) <= kZLModAntiRecallTTLSeconds) count++;
+    }];
+    os_unfair_lock_unlock(&_lock);
+    return count;
 }
 
 - (void)clearCurrentAccountHistory {
@@ -499,143 +722,49 @@ static void ZLModClearUnhiddenMessages(void);
     if (scope.length == 0) return;
     NSString *prefix = [scope stringByAppendingString:@":"];
 
+    NSDictionary *snapshot = nil;
+    NSMutableArray<NSString *> *photosToDelete = [NSMutableArray array];
     os_unfair_lock_lock(&_lock);
     NSMutableArray<NSString *> *toRemove = [NSMutableArray array];
     for (NSString *k in self.records) {
-        if ([k hasPrefix:prefix]) [toRemove addObject:k];
+        if ([k hasPrefix:prefix]) {
+            [toRemove addObject:k];
+            NSString *pf = self.records[k][@"photoFile"];
+            if ([pf isKindOfClass:[NSString class]] && pf.length > 0) [photosToDelete addObject:pf];
+        }
     }
     if (toRemove.count > 0) {
         [self.records removeObjectsForKeys:toRemove];
-        [self persistLocked];
+        snapshot = [self immutableSnapshotLocked];
     }
     os_unfair_lock_unlock(&_lock);
+
+    if (snapshot) ZLModWritePropertyListAsync(snapshot, self.storagePath, nil);
+    if (photosToDelete.count > 0) [self deletePhotoFilesAsync:photosToDelete];
 }
 
 - (void)clearAllHistory {
     [self purgeLiveSnapshots];
+    NSDictionary *snapshot = nil;
     os_unfair_lock_lock(&_lock);
     [self.records removeAllObjects];
-    [[NSFileManager defaultManager] removeItemAtPath:self.storagePath error:nil];
+    snapshot = [self immutableSnapshotLocked];
     os_unfair_lock_unlock(&_lock);
-    ZLMOD_LOG(@"antirecall: all local history cleared");
+
+    ZLModWritePropertyListAsync(snapshot, self.storagePath, nil);
+    NSString *photoDir = [self.photoDirectoryPath copy];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        [[NSFileManager defaultManager] removeItemAtPath:photoDir error:nil];
+    });
+    ZLMOD_LOG(@"antirecall: all local history & encrypted photos cleared");
 }
 
 @end
 
-#pragma mark - ChatEntity inspection & runtime hooks
-
-static void ZLModExtractChatEntityFields(id chatEntity,
-                                         NSString *fallbackThreadId,
-                                         int64_t *outGlobalId,
-                                         int64_t *outClientId,
-                                         NSString **outMessage,
-                                         NSString **outSenderName,
-                                         NSString **outSenderId,
-                                         NSString **outThreadId,
-                                         NSTimeInterval *outTimestamp) {
-    int64_t gid = 0;
-    for (NSString *s in @[@"globalMsgId", @"globalId", @"globalID", @"global_id"]) {
-        gid = ZLModSafeInt64Property(chatEntity, NSSelectorFromString(s), 0);
-        if (gid > 0) break;
-    }
-    int64_t cid = 0;
-    for (NSString *s in @[@"cliMsgId", @"clientId", @"clientID", @"client_id"]) {
-        cid = ZLModSafeInt64Property(chatEntity, NSSelectorFromString(s), 0);
-        if (cid > 0) break;
-    }
-    NSString *msg = nil;
-    for (NSString *s in @[@"originTextRecallMsg", @"originText", @"message", @"content", @"msgContent", @"desc"]) {
-        NSString *v = ZLModSafeStringProperty(chatEntity, NSSelectorFromString(s));
-        if (v.length > 0 && ![v containsString:@"thu hồi"]) {
-            msg = v;
-            break;
-        }
-    }
-    if (msg.length == 0) {
-        msg = ZLModSafeStringProperty(chatEntity, sel_registerName("message"));
-    }
-    NSString *senderName = nil;
-    for (NSString *s in @[@"displayname", @"senderName", @"senderDisplayName", @"fromName", @"sender"]) {
-        NSString *v = ZLModSafeStringProperty(chatEntity, NSSelectorFromString(s));
-        if (v.length > 0) { senderName = v; break; }
-    }
-    NSString *senderId = nil;
-    for (NSString *s in @[@"fuid", @"senderId", @"fromUid", @"senderUID"]) {
-        NSString *v = ZLModSafeStringProperty(chatEntity, NSSelectorFromString(s));
-        if (v.length > 0) { senderId = v; break; }
-    }
-    NSString *tid = ZLModSafeStringProperty(chatEntity, sel_registerName("threadId"));
-    if (tid.length == 0) {
-        tid = ZLModSafeStringProperty(chatEntity, sel_registerName("tuid"));
-    }
-    if (tid.length == 0) {
-        tid = fallbackThreadId;
-    }
-    NSTimeInterval ts = ZLModSafeDoubleProperty(chatEntity, sel_registerName("time"), 0.0);
-    if (ts > 100000000000.0) {
-        ts /= 1000.0; // normalize ms to seconds if needed
-    }
-
-    if (outGlobalId) *outGlobalId = gid;
-    if (outClientId) *outClientId = cid;
-    if (outMessage) *outMessage = msg;
-    if (outSenderName) *outSenderName = senderName;
-    if (outSenderId) *outSenderId = senderId;
-    if (outThreadId) *outThreadId = tid;
-    if (outTimestamp) *outTimestamp = ts;
-}
-
-static void ZLModEnumerateChatEntities(id container, void (^block)(id entity)) {
-    if (!container || !block) return;
-    if ([container isKindOfClass:[NSArray class]] || [container isKindOfClass:[NSSet class]]) {
-        for (id item in container) {
-            block(item);
-        }
-        return;
-    }
-    if ([container isKindOfClass:[NSDictionary class]]) {
-        [(NSDictionary *)container enumerateKeysAndObjectsUsingBlock:^(__unused id key, id obj, __unused BOOL *stop) {
-            if ([obj isKindOfClass:[NSArray class]]) {
-                for (id sub in (NSArray *)obj) block(sub);
-            } else {
-                block(obj);
-            }
-        }];
-        return;
-    }
-    block(container);
-}
-
-static void ZLModSnapshotEntities(id container, NSString *fallbackThreadId) {
-    ZLModEnumerateChatEntities(container, ^(id entity) {
-        int64_t gid = 0, cid = 0;
-        NSString *msg = nil, *sName = nil, *sId = nil, *tid = nil;
-        NSTimeInterval ts = 0;
-        ZLModExtractChatEntityFields(entity, fallbackThreadId, &gid, &cid, &msg, &sName, &sId, &tid, &ts);
-        if ((gid > 0 || cid > 0) && msg.length > 0 && ![msg hasPrefix:ZLModAntiRecallNoticePrefix] &&
-            ![msg hasPrefix:@"Tin nhắn đã được thu hồi"]) {
-            [[ZLModAntiRecallStore shared] cacheLiveSnapshotWithGlobalId:gid
-                                                                clientId:cid
-                                                                 message:msg
-                                                              senderName:sName
-                                                                senderId:sId
-                                                                threadId:tid
-                                                               timestamp:ts];
-            [[NSNotificationCenter defaultCenter] postNotificationName:@"ZLModChatEntityArrivedNotification"
-                                                                object:entity
-                                                              userInfo:fallbackThreadId ? @{@"threadId": fallbackThreadId} : nil];
-        }
-    });
-}
-
-#pragma mark - Chat Bubble "Hiện / Ẩn" (In-Place Unhide Recalled Message) feature
-
-static const NSInteger kZLModActionUnhideRecall = 99001;
-static const NSInteger kZLModActionHideRecall   = 99002;
+#pragma mark - In-Place Unhide/Hide State & Cell Reuse Safety
 
 static os_unfair_lock gUnhiddenLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableSet<NSString *> *gUnhiddenMessageKeys = nil;
-static const char * const kZLModOrigRecallTextKey = "ZLModOrigRecallText";
 
 static NSString *ZLModUnhiddenKey(NSString *accountScope, NSString *threadId, int64_t gid, int64_t cid) {
     NSString *scope = accountScope.length ? accountScope : (ZLModCurrentAccountScope() ?: @"anon");
@@ -675,60 +804,36 @@ static void ZLModSetMessageUnhidden(NSString *accountScope, NSString *threadId, 
     os_unfair_lock_unlock(&gUnhiddenLock);
 }
 
-static UIImage *ZLModExtractPhotoFromChat(id chat) {
-    if (!chat) return nil;
-    for (NSString *selName in @[@"originalImage", @"thumbImage", @"photo", @"image"]) {
-        id img = ZLModSafeObjectProperty(chat, NSSelectorFromString(selName));
-        if ([img isKindOfClass:[UIImage class]]) return (UIImage *)img;
-    }
-    for (NSString *selName in @[@"hdLocalFilePath", @"chatlocalpath", @"backupFilePathAbs", @"dataFilePath", @"filePathStr"]) {
-        NSString *path = ZLModSafeStringProperty(chat, NSSelectorFromString(selName));
-        if (path.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            UIImage *img = [UIImage imageWithContentsOfFile:path];
-            if (img) return img;
-        }
-    }
-    return nil;
-}
-
 static NSString *ZLModResolveRecalledText(id chat, int64_t gid, int64_t cid) {
     NSString *scope = ZLModCurrentAccountScope();
     ZLModAntiRecallStore *store = [ZLModAntiRecallStore shared];
 
-    // 1. Persistent decrypted store
+    // 1. Encrypted persistent archive
     NSString *decrypted = [store recalledTextForGlobalId:gid clientId:cid];
-    if (decrypted.length > 0 &&
-        ![decrypted localizedCaseInsensitiveContainsString:@"thu hồi"] &&
-        ![decrypted localizedCaseInsensitiveContainsString:@"recalled"]) {
+    if (decrypted.length > 0 && ![ZLModChatEntityAdapter isPlaceholderRecalledText:decrypted]) {
         return decrypted;
     }
 
-    // 2. Live snapshot
+    // 2. Live pre-recall snapshot
     ZLModLiveMessageSnapshot *snap = [store liveSnapshotForAccountScope:scope globalId:gid clientId:cid];
-    if (snap.message.length > 0 &&
-        ![snap.message localizedCaseInsensitiveContainsString:@"thu hồi"] &&
-        ![snap.message localizedCaseInsensitiveContainsString:@"recalled"]) {
+    if (snap.message.length > 0 && ![ZLModChatEntityAdapter isPlaceholderRecalledText:snap.message]) {
         return snap.message;
     }
 
-    // 3. ChatEntity fields
+    // 3. Host entity original fields
     if (chat) {
-        for (NSString *s in @[@"originTextRecallMsg", @"originText"]) {
+        for (NSString *s in @[@"originTextRecallMsg", @"_originTextRecallMsg", @"originText"]) {
             NSString *v = ZLModSafeStringProperty(chat, NSSelectorFromString(s));
-            if (v.length > 0 &&
-                ![v localizedCaseInsensitiveContainsString:@"thu hồi"] &&
-                ![v localizedCaseInsensitiveContainsString:@"recalled"]) {
+            if (v.length > 0 && ![ZLModChatEntityAdapter isPlaceholderRecalledText:v]) {
                 return v;
             }
         }
     }
 
-    // 4. Formatted notice fallback
     if (gid > 0 || cid > 0) {
         NSString *notice = [store formattedNoticeForGlobalId:gid clientId:cid];
         if (notice.length > 0) return notice;
     }
-
     return nil;
 }
 
@@ -738,12 +843,8 @@ static UILabel *ZLModFindRecallLabel(UIView *view, BOOL isUnhiding) {
         UILabel *lbl = (UILabel *)view;
         if (isUnhiding) {
             NSString *curText = lbl.text;
-            if (curText.length > 0) {
-                BOOL looksLikeRecalled = [curText localizedCaseInsensitiveContainsString:@"thu hồi"] ||
-                                         [curText localizedCaseInsensitiveContainsString:@"recalled"];
-                if (looksLikeRecalled) {
-                    return lbl;
-                }
+            if ([ZLModChatEntityAdapter isPlaceholderRecalledText:curText]) {
+                return lbl;
             }
         } else {
             NSString *orig = objc_getAssociatedObject(lbl, kZLModOrigRecallTextKey);
@@ -757,6 +858,21 @@ static UILabel *ZLModFindRecallLabel(UIView *view, BOOL isUnhiding) {
         if (found) return found;
     }
     return nil;
+}
+
+static void ZLModCleanupAssociatedRecallLabelsInView(UIView *view) {
+    if (!view) return;
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *lbl = (UILabel *)view;
+        NSString *orig = objc_getAssociatedObject(lbl, kZLModOrigRecallTextKey);
+        if (orig.length > 0) {
+            lbl.text = orig;
+            objc_setAssociatedObject(lbl, kZLModOrigRecallTextKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        }
+    }
+    for (UIView *sub in view.subviews) {
+        ZLModCleanupAssociatedRecallLabelsInView(sub);
+    }
 }
 
 static BOOL ZLModUpdateTextInViewHierarchy(UIView *view, NSString *newText, BOOL isUnhiding) {
@@ -849,9 +965,17 @@ static id ZLModMakeRecallMenuItem(id template, NSString *title, NSString *symbol
     return vm;
 }
 
-@interface ZLModPhotoPreviewViewController : UIViewController
+#pragma mark - Pinch-Zoom Recalled Photo Preview Modal
+
+@interface ZLModPhotoPreviewViewController : UIViewController <UIScrollViewDelegate>
 @property (nonatomic, strong) UIImage *photo;
 @property (nonatomic, copy) NSString *senderName;
+@property (nonatomic, strong) UIScrollView *scrollView;
+@property (nonatomic, strong) UIImageView *imageView;
+@property (nonatomic, strong) UINavigationBar *navBar;
+@property (nonatomic, strong) UIView *bottomBar;
+@property (nonatomic, strong) UIButton *saveBtn;
+@property (nonatomic, strong) UIButton *copyBtn;
 @end
 
 @implementation ZLModPhotoPreviewViewController
@@ -860,64 +984,99 @@ static id ZLModMakeRecallMenuItem(id template, NSString *title, NSString *symbol
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor blackColor];
 
-    CGFloat navH = 56.0;
-    CGFloat topSafe = 20.0;
-    if (@available(iOS 11.0, *)) {
-        topSafe = self.view.safeAreaInsets.top > 0 ? self.view.safeAreaInsets.top : 44.0;
-    }
-    
-    UINavigationBar *navBar = [[UINavigationBar alloc] initWithFrame:CGRectMake(0, topSafe, self.view.bounds.size.width, navH)];
-    navBar.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
-    navBar.barStyle = UIBarStyleBlack;
-    navBar.translucent = YES;
-    
+    self.scrollView = [[UIScrollView alloc] initWithFrame:self.view.bounds];
+    self.scrollView.delegate = self;
+    self.scrollView.minimumZoomScale = 1.0;
+    self.scrollView.maximumZoomScale = 4.0;
+    self.scrollView.showsHorizontalScrollIndicator = NO;
+    self.scrollView.showsVerticalScrollIndicator = NO;
+    [self.view addSubview:self.scrollView];
+
+    self.imageView = [[UIImageView alloc] initWithFrame:self.scrollView.bounds];
+    self.imageView.contentMode = UIViewContentModeScaleAspectFit;
+    self.imageView.image = self.photo;
+    self.imageView.userInteractionEnabled = YES;
+    self.imageView.isAccessibilityElement = YES;
+    self.imageView.accessibilityLabel = @"Ảnh đã thu hồi";
+    [self.scrollView addSubview:self.imageView];
+
+    UITapGestureRecognizer *doubleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleDoubleTap:)];
+    doubleTap.numberOfTapsRequired = 2;
+    [self.scrollView addGestureRecognizer:doubleTap];
+
+    self.navBar = [[UINavigationBar alloc] init];
+    self.navBar.barStyle = UIBarStyleBlack;
+    self.navBar.translucent = YES;
     NSString *navTitle = self.senderName.length ? [NSString stringWithFormat:@"Ảnh từ %@", self.senderName] : @"Ảnh đã thu hồi";
     UINavigationItem *navItem = [[UINavigationItem alloc] initWithTitle:navTitle];
-    UIBarButtonItem *closeBtn = [[UIBarButtonItem alloc] initWithTitle:@"Đóng" style:UIBarButtonItemStyleDone target:self action:@selector(closeTapped)];
+    UIBarButtonItem *closeBtn = [[UIBarButtonItem alloc] initWithTitle:@"Đóng"
+                                                                 style:UIBarButtonItemStyleDone
+                                                                target:self
+                                                                action:@selector(closeTapped)];
     closeBtn.tintColor = [UIColor whiteColor];
+    closeBtn.accessibilityLabel = @"Đóng xem ảnh";
     navItem.rightBarButtonItem = closeBtn;
-    [navBar pushNavigationItem:navItem animated:NO];
-    [self.view addSubview:navBar];
+    [self.navBar pushNavigationItem:navItem animated:NO];
+    [self.view addSubview:self.navBar];
 
-    CGFloat bottomBarH = 70.0;
-    CGFloat bottomSafe = 20.0;
-    if (@available(iOS 11.0, *)) {
-        bottomSafe = self.view.safeAreaInsets.bottom > 0 ? self.view.safeAreaInsets.bottom : 20.0;
+    self.bottomBar = [[UIView alloc] init];
+    self.bottomBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.82];
+    [self.view addSubview:self.bottomBar];
+
+    self.saveBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.saveBtn setTitle:@" Lưu vào Ảnh" forState:UIControlStateNormal];
+    [self.saveBtn setImage:[UIImage systemImageNamed:@"square.and.arrow.down"] forState:UIControlStateNormal];
+    [self.saveBtn setTintColor:[UIColor whiteColor]];
+    self.saveBtn.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+    self.saveBtn.titleLabel.adjustsFontForContentSizeCategory = YES;
+    self.saveBtn.accessibilityLabel = @"Lưu ảnh vào Thư viện";
+    [self.saveBtn addTarget:self action:@selector(saveTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.bottomBar addSubview:self.saveBtn];
+
+    self.copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.copyBtn setTitle:@" Sao chép ảnh" forState:UIControlStateNormal];
+    [self.copyBtn setImage:[UIImage systemImageNamed:@"doc.on.doc"] forState:UIControlStateNormal];
+    [self.copyBtn setTintColor:[UIColor whiteColor]];
+    self.copyBtn.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+    self.copyBtn.titleLabel.adjustsFontForContentSizeCategory = YES;
+    self.copyBtn.accessibilityLabel = @"Sao chép ảnh vào bộ nhớ tạm";
+    [self.copyBtn addTarget:self action:@selector(copyTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.bottomBar addSubview:self.copyBtn];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    CGFloat topSafe = self.view.safeAreaInsets.top;
+    CGFloat bottomSafe = self.view.safeAreaInsets.bottom;
+    CGFloat navH = 52.0;
+    CGFloat bottomH = 64.0 + bottomSafe;
+
+    self.navBar.frame = CGRectMake(0.0, topSafe, w, navH);
+    self.bottomBar.frame = CGRectMake(0.0, h - bottomH, w, bottomH);
+    self.saveBtn.frame = CGRectMake(16.0, 10.0, 150.0, 44.0);
+    self.copyBtn.frame = CGRectMake(w - 166.0, 10.0, 150.0, 44.0);
+
+    CGRect imgRect = CGRectMake(0.0, topSafe + navH, w, MAX(h - topSafe - navH - bottomH, 100.0));
+    self.scrollView.zoomScale = 1.0;
+    self.scrollView.frame = imgRect;
+    self.scrollView.contentSize = imgRect.size;
+    self.imageView.frame = CGRectMake(0.0, 0.0, imgRect.size.width, imgRect.size.height);
+}
+
+- (UIView *)viewForZoomingInScrollView:(__unused UIScrollView *)scrollView {
+    return self.imageView;
+}
+
+- (void)handleDoubleTap:(UITapGestureRecognizer *)tap {
+    if (self.scrollView.zoomScale > 1.05) {
+        [self.scrollView setZoomScale:1.0 animated:YES];
+    } else {
+        CGPoint pt = [tap locationInView:self.imageView];
+        CGRect zoomRect = CGRectMake(pt.x - 60.0, pt.y - 60.0, 120.0, 120.0);
+        [self.scrollView zoomToRect:zoomRect animated:YES];
     }
-    CGFloat totalBottomH = bottomBarH + bottomSafe;
-    CGFloat imgTop = topSafe + navH;
-    CGFloat imgH = self.view.bounds.size.height - imgTop - totalBottomH;
-
-    UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(0, imgTop, self.view.bounds.size.width, imgH)];
-    iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    iv.contentMode = UIViewContentModeScaleAspectFit;
-    iv.image = self.photo;
-    iv.userInteractionEnabled = YES;
-    [self.view addSubview:iv];
-
-    UIView *bottomBar = [[UIView alloc] initWithFrame:CGRectMake(0, self.view.bounds.size.height - totalBottomH, self.view.bounds.size.width, totalBottomH)];
-    bottomBar.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
-    bottomBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.8];
-    [self.view addSubview:bottomBar];
-
-    UIButton *saveBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    saveBtn.frame = CGRectMake(20, 10, 140, 44);
-    [saveBtn setTitle:@" Lưu vào Ảnh" forState:UIControlStateNormal];
-    [saveBtn setImage:[UIImage systemImageNamed:@"square.and.arrow.down"] forState:UIControlStateNormal];
-    [saveBtn setTintColor:[UIColor whiteColor]];
-    saveBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-    [saveBtn addTarget:self action:@selector(saveTapped) forControlEvents:UIControlEventTouchUpInside];
-    [bottomBar addSubview:saveBtn];
-
-    UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    copyBtn.frame = CGRectMake(self.view.bounds.size.width - 160, 10, 140, 44);
-    copyBtn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    [copyBtn setTitle:@" Sao chép ảnh" forState:UIControlStateNormal];
-    [copyBtn setImage:[UIImage systemImageNamed:@"doc.on.doc"] forState:UIControlStateNormal];
-    [copyBtn setTintColor:[UIColor whiteColor]];
-    copyBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-    [copyBtn addTarget:self action:@selector(copyTapped) forControlEvents:UIControlEventTouchUpInside];
-    [bottomBar addSubview:copyBtn];
 }
 
 - (void)closeTapped {
@@ -930,9 +1089,9 @@ static id ZLModMakeRecallMenuItem(id template, NSString *title, NSString *symbol
     }
 }
 
-- (void)image:(UIImage *)image didFinishSavingWithError:(NSError *)error contextInfo:(void *)contextInfo {
+- (void)image:(__unused UIImage *)image didFinishSavingWithError:(NSError *)error contextInfo:(__unused void *)contextInfo {
     if (error) {
-        ZLModShowToast(@"Lỗi khi lưu ảnh vào Thư viện");
+        ZLModShowToast([NSString stringWithFormat:@"Lỗi lưu ảnh: %@", error.localizedDescription ?: @"Không có quyền"]);
     } else {
         ZLModShowToast(@"Đã lưu ảnh vào Thư viện Ảnh");
     }
@@ -949,216 +1108,34 @@ static id ZLModMakeRecallMenuItem(id template, NSString *title, NSString *symbol
 
 static BOOL ZLModIsChatRecalled(id chat) {
     if (!chat) return NO;
-    NSString *origText = ZLModSafeStringProperty(chat, sel_registerName("originTextRecallMsg"));
-    if (origText.length > 0) return YES;
-
-    SEL recallAllSel = sel_registerName("isRecalledOrFailOrRolledAll");
-    if ([chat respondsToSelector:recallAllSel]) {
-        if (((BOOL (*)(id, SEL))objc_msgSend)(chat, recallAllSel)) return YES;
-    }
-    SEL recallDelSel = sel_registerName("isRecallDelByMySelf");
-    if ([chat respondsToSelector:recallDelSel]) {
-        if (((BOOL (*)(id, SEL))objc_msgSend)(chat, recallDelSel)) return YES;
-    }
-    int64_t msgType = ZLModSafeInt64Property(chat, sel_registerName("messageType"), 0);
-    if (msgType == 51) return YES;
-
-    NSString *msg = ZLModSafeStringProperty(chat, sel_registerName("message"));
-    if ([msg localizedCaseInsensitiveContainsString:@"thu hồi"] ||
-        [msg localizedCaseInsensitiveContainsString:@"recalled"]) {
-        return YES;
-    }
-
-    int64_t gid = 0, cid = 0;
-    ZLModExtractChatEntityFields(chat, nil, &gid, &cid, NULL, NULL, NULL, NULL, NULL);
-    if ([[ZLModAntiRecallStore shared] recalledTextForGlobalId:gid clientId:cid].length > 0) {
+    ZLModMessageModel *model = [ZLModChatEntityAdapter modelFromChatEntity:chat fallbackThreadId:nil];
+    if (model.isRecalled) return YES;
+    if ((model.globalId > 0 || model.clientId > 0) &&
+        [[ZLModAntiRecallStore shared] recalledTextForGlobalId:model.globalId clientId:model.clientId].length > 0) {
         return YES;
     }
     return NO;
 }
 
-static void __attribute__((unused)) ZLModPresentRecalledMessageContent(id chat, id presenter) {
-    if (!chat) {
-        ZLModShowToast(@"Không tìm thấy thông tin tin nhắn");
-        return;
-    }
-
-    int64_t gid = 0, cid = 0;
-    NSString *msg = nil, *sName = nil, *sId = nil, *tid = nil;
-    NSTimeInterval ts = 0;
-    ZLModExtractChatEntityFields(chat, nil, &gid, &cid, &msg, &sName, &sId, &tid, &ts);
-
-    NSString *scope = ZLModCurrentAccountScope();
-    ZLModAntiRecallStore *store = [ZLModAntiRecallStore shared];
-
-    // Check store first
-    NSString *decrypted = [store recalledTextForGlobalId:gid clientId:cid];
-
-    // Also check live snapshot
-    if (decrypted.length == 0) {
-        ZLModLiveMessageSnapshot *snap = [store liveSnapshotForAccountScope:scope globalId:gid clientId:cid];
-        if (snap.message.length > 0) {
-            decrypted = snap.message;
-            if (sName.length == 0) sName = snap.senderName;
-        }
-    }
-
-    // Check ChatEntity fields
-    if (decrypted.length == 0) {
-        for (NSString *s in @[@"originTextRecallMsg", @"originText"]) {
-            NSString *v = ZLModSafeStringProperty(chat, NSSelectorFromString(s));
-            if (v.length > 0 && ![v containsString:@"thu hồi"]) {
-                decrypted = v;
-                break;
-            }
-        }
-    }
-
-    // Check for photo/image
-    UIImage *photo = ZLModExtractPhotoFromChat(chat);
-
-    UIViewController *presentingVC = ZLModTopPresenterViewController();
-    if (!presentingVC && [presenter isKindOfClass:[UIView class]]) {
-        UIResponder *r = [(UIView *)presenter nextResponder];
-        while (r && ![r isKindOfClass:[UIViewController class]]) {
-            r = r.nextResponder;
-        }
-        presentingVC = (UIViewController *)r;
-    }
-    if (!presentingVC) presentingVC = ZLModTopPresenterViewController();
-    if (!presentingVC) {
-        ZLModShowToast(decrypted.length ? decrypted : @"Không tìm thấy nội dung trước thu hồi");
-        return;
-    }
-
-    NSString *displaySender = (sName.length > 0) ? sName : @"Người gửi";
-
-    if (photo) {
-        ZLModPhotoPreviewViewController *pvc = [[ZLModPhotoPreviewViewController alloc] init];
-        pvc.photo = photo;
-        pvc.senderName = displaySender;
-        pvc.modalPresentationStyle = UIModalPresentationFullScreen;
-        [presentingVC presentViewController:pvc animated:YES completion:nil];
-        return;
-    }
-
-    NSString *displayText = (decrypted.length > 0) ? decrypted : @"Tin nhắn đã được thu hồi trước khi ZLMod kịp ghi nhận.";
-
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Tin nhắn đã thu hồi — %@", displaySender]
-                                                                   message:displayText
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Sao chép" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        [UIPasteboard generalPasteboard].string = displayText;
-        ZLModShowToast(@"Đã sao chép nội dung tin nhắn");
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-    [presentingVC presentViewController:alert animated:YES completion:nil];
-}
+#pragma mark - Install (subscribes to ZLModMessageTapBus + installs non-mutating UI & reuse hooks)
 
 void ZLModAntiRecallInstall(void) {
     NSUInteger installed = 0;
 
-    Class convModelCls = NSClassFromString(@"ConversationModel");
-    if (convModelCls) {
-        // 1. ConversationModel -didLoadChats:config: [v32@0:8@16@24]
-        SEL didLoadSel = sel_registerName("didLoadChats:config:");
-        if (ZLModClassHasInstanceMethod(convModelCls, didLoadSel)) {
-            IMP orig = class_getMethodImplementation(convModelCls, didLoadSel);
-            if (ZLModReplaceMethod(convModelCls, didLoadSel, 2, "v", ^(id selfObj, id chats, id config) {
-                if ([[ZLModPreferences shared] boolForKey:kZLModAntiRecall] && chats) {
-                    NSString *convTid = ZLModSafeStringProperty(selfObj, sel_registerName("threadId"));
-                    ZLModSnapshotEntities(chats, convTid);
-                }
-                if (orig) ((void (*)(id, SEL, id, id))orig)(selfObj, didLoadSel, chats, config);
-            })) {
-                installed++;
-            }
+    // 1. Register as consumer of the decoupled ZLModMessageTapBus
+    [[ZLModMessageTapBus shared] registerConsumerNamed:@"AntiRecall"
+                                                 block:^(ZLModMessageModel *model, id rawEntity, ZLModMessageTapEventKind kind) {
+        if (![[ZLModPreferences shared] boolForKey:kZLModAntiRecall]) return;
+        UIImage *photo = model.hasPhotoAttachment ? [ZLModChatEntityAdapter extractPhotoImageFromChatEntity:rawEntity] : nil;
+        if (kind == ZLModMessageTapEventObserved) {
+            [[ZLModAntiRecallStore shared] cacheLiveSnapshotFromModel:model photoImage:photo];
+        } else if (kind == ZLModMessageTapEventRecalled) {
+            [[ZLModAntiRecallStore shared] saveSnapshotFromModel:model photoImage:photo];
         }
+    }];
+    installed++;
 
-        // 2. ConversationModel -updateDBWhenRecalledChats:completion: [v32@0:8@16@?24]
-        SEL recallSel = sel_registerName("updateDBWhenRecalledChats:completion:");
-        if (ZLModClassHasInstanceMethod(convModelCls, recallSel)) {
-            IMP orig = class_getMethodImplementation(convModelCls, recallSel);
-            if (ZLModReplaceMethod(convModelCls, recallSel, 2, "v", ^(id selfObj, id recalledChats, id completion) {
-                if ([[ZLModPreferences shared] boolForKey:kZLModAntiRecall] && recalledChats) {
-                    NSString *scope = ZLModCurrentAccountScope();
-                    NSString *convTid = ZLModSafeStringProperty(selfObj, sel_registerName("threadId"));
-                    ZLModAntiRecallStore *store = [ZLModAntiRecallStore shared];
-
-                    ZLModEnumerateChatEntities(recalledChats, ^(id entity) {
-                        int64_t gid = 0, cid = 0;
-                        NSString *msg = nil, *sName = nil, *sId = nil, *tid = nil;
-                        NSTimeInterval ts = 0;
-                        ZLModExtractChatEntityFields(entity, convTid, &gid, &cid, &msg, &sName, &sId, &tid, &ts);
-
-                        ZLModLiveMessageSnapshot *cached = [store liveSnapshotForAccountScope:scope globalId:gid clientId:cid];
-                        if (cached) {
-                            // The entity may already carry Zalo's recalled placeholder; the
-                            // pre-recall snapshot is always the authoritative original text.
-                            if (cached.message.length > 0) msg = cached.message;
-                            if (sName.length == 0) sName = cached.senderName;
-                            if (sId.length == 0) sId = cached.senderId;
-                            if (tid.length == 0) tid = cached.threadId;
-                            if (ts <= 0) ts = cached.timestamp;
-                        }
-                        BOOL looksRecalled = (!cached &&
-                            ([msg localizedCaseInsensitiveContainsString:@"thu hồi"] ||
-                             [msg localizedCaseInsensitiveContainsString:@"recalled"]));
-                        if ((gid > 0 || cid > 0) && msg.length > 0 && !looksRecalled) {
-                            [store saveSnapshotWithGlobalId:gid
-                                                   clientId:cid
-                                                    message:msg
-                                                 senderName:sName
-                                                   senderId:sId
-                                                   threadId:tid
-                                                  timestamp:ts];
-                        }
-                    });
-                }
-                if (orig) ((void (*)(id, SEL, id, id))orig)(selfObj, recallSel, recalledChats, completion);
-            })) {
-                installed++;
-            }
-        }
-    }
-
-    // 2b. ChatDataManager incoming-message entry points. Messages that arrive while the
-    // app is running never pass through didLoadChats:, so the original text must be
-    // snapshotted here, before any later recall rewrites the entity.
-    Class chatMgrCls = NSClassFromString(@"ChatDataManager");
-    if (chatMgrCls) {
-        // -addChats:byUserId:willAlert:fromSrc: [v44@0:8@16@24B32q36]
-        SEL addChatsSel = sel_registerName("addChats:byUserId:willAlert:fromSrc:");
-        if (ZLModClassHasInstanceMethod(chatMgrCls, addChatsSel)) {
-            IMP orig = class_getMethodImplementation(chatMgrCls, addChatsSel);
-            if (ZLModReplaceMethod(chatMgrCls, addChatsSel, 4, "v",
-                                   ^(id selfObj, id chats, id userId, BOOL willAlert, NSInteger src) {
-                if ([[ZLModPreferences shared] boolForKey:kZLModAntiRecall] && chats) {
-                    ZLModSnapshotEntities(chats, nil);
-                }
-                if (orig) ((void (*)(id, SEL, id, id, BOOL, NSInteger))orig)(selfObj, addChatsSel, chats, userId, willAlert, src);
-            })) {
-                installed++;
-            }
-        }
-
-        // -addChat:byUserId:willAlert:fromSrc: [v44@0:8@16@24B32q36]
-        SEL addChatSel = sel_registerName("addChat:byUserId:willAlert:fromSrc:");
-        if (ZLModClassHasInstanceMethod(chatMgrCls, addChatSel)) {
-            IMP orig = class_getMethodImplementation(chatMgrCls, addChatSel);
-            if (ZLModReplaceMethod(chatMgrCls, addChatSel, 4, "v",
-                                   ^(id selfObj, id chat, id userId, BOOL willAlert, NSInteger src) {
-                if ([[ZLModPreferences shared] boolForKey:kZLModAntiRecall] && chat) {
-                    ZLModSnapshotEntities(chat, nil);
-                }
-                if (orig) ((void (*)(id, SEL, id, id, BOOL, NSInteger))orig)(selfObj, addChatSel, chat, userId, willAlert, src);
-            })) {
-                installed++;
-            }
-        }
-    }
-
-    // 3. ChatEntity -_getRecalledMsgPreviewFromSource: [@24@0:8q16]
+    // 2. Non-mutating ChatEntity display hooks
     Class chatEntityCls = NSClassFromString(@"ChatEntity");
     if (chatEntityCls) {
         SEL previewSel = sel_registerName("_getRecalledMsgPreviewFromSource:");
@@ -1169,27 +1146,20 @@ void ZLModAntiRecallInstall(void) {
                 if (![[ZLModPreferences shared] boolForKey:kZLModAntiRecall]) {
                     return origPreview;
                 }
-                int64_t gid = ZLModSafeInt64Property(selfObj, sel_registerName("globalId"), 0);
-                int64_t cid = ZLModSafeInt64Property(selfObj, sel_registerName("clientId"), 0);
-                if (gid <= 0 && cid <= 0) return origPreview;
+                ZLModMessageModel *m = [ZLModChatEntityAdapter modelFromChatEntity:selfObj fallbackThreadId:nil];
+                if (!m || (m.globalId <= 0 && m.clientId <= 0)) return origPreview;
 
-                NSString *scope = ZLModCurrentAccountScope();
-                NSString *tid = ZLModSafeStringProperty(selfObj, sel_registerName("threadId")) ?:
-                                ZLModSafeStringProperty(selfObj, sel_registerName("tuid"));
-
-                if (ZLModIsMessageUnhidden(scope, tid, gid, cid)) {
-                    NSString *unhiddenText = ZLModResolveRecalledText(selfObj, gid, cid);
+                if (ZLModIsMessageUnhidden(m.accountScope, m.threadId, m.globalId, m.clientId)) {
+                    NSString *unhiddenText = ZLModResolveRecalledText(selfObj, m.globalId, m.clientId);
                     if (unhiddenText.length > 0) return unhiddenText;
                 }
-
-                NSString *notice = [[ZLModAntiRecallStore shared] formattedNoticeForGlobalId:gid clientId:cid];
+                NSString *notice = [[ZLModAntiRecallStore shared] formattedNoticeForGlobalId:m.globalId clientId:m.clientId];
                 return (notice.length > 0) ? notice : origPreview;
             })) {
                 installed++;
             }
         }
 
-        // 3b. ChatEntity -message [@16@0:8]
         SEL messageSel = sel_registerName("message");
         if (ZLModClassHasInstanceMethod(chatEntityCls, messageSel)) {
             IMP orig = class_getMethodImplementation(chatEntityCls, messageSel);
@@ -1198,11 +1168,14 @@ void ZLModAntiRecallInstall(void) {
                 if (![[ZLModPreferences shared] boolForKey:kZLModAntiRecall]) {
                     return origMsg;
                 }
-                int64_t gid = 0, cid = 0;
-                NSString *tid = nil;
-                ZLModExtractChatEntityFields(selfObj, nil, &gid, &cid, NULL, NULL, NULL, &tid, NULL);
+                int64_t gid = ZLModSafeInt64Property(selfObj, sel_registerName("globalId"), 0);
+                if (gid <= 0) gid = ZLModSafeInt64Property(selfObj, sel_registerName("globalMsgId"), 0);
+                int64_t cid = ZLModSafeInt64Property(selfObj, sel_registerName("clientId"), 0);
+                if (cid <= 0) cid = ZLModSafeInt64Property(selfObj, sel_registerName("cliMsgId"), 0);
                 if (gid > 0 || cid > 0) {
                     NSString *scope = ZLModCurrentAccountScope();
+                    NSString *tid = ZLModSafeStringProperty(selfObj, sel_registerName("threadId")) ?:
+                                    ZLModSafeStringProperty(selfObj, sel_registerName("tuid"));
                     if (ZLModIsMessageUnhidden(scope, tid, gid, cid)) {
                         NSString *unhidden = ZLModResolveRecalledText(selfObj, gid, cid);
                         if (unhidden.length > 0) return unhidden;
@@ -1215,7 +1188,21 @@ void ZLModAntiRecallInstall(void) {
         }
     }
 
-    // 4. MenuButton hooks for Chat Bubble "Hiện / Ẩn" in-place feature
+    // 3. Cell reuse cleanup hooks so associated recall labels never leak into recycled chat bubbles
+    SEL reuseSel = sel_registerName("prepareForReuse");
+    for (Class cellBaseCls in @[[UITableViewCell class], [UICollectionViewCell class]]) {
+        if (ZLModClassHasInstanceMethod(cellBaseCls, reuseSel)) {
+            IMP orig = class_getMethodImplementation(cellBaseCls, reuseSel);
+            if (ZLModReplaceMethod(cellBaseCls, reuseSel, 0, "v", ^(id selfObj) {
+                ZLModCleanupAssociatedRecallLabelsInView((UIView *)selfObj);
+                if (orig) ((void (*)(id, SEL))orig)(selfObj, reuseSel);
+            })) {
+                installed++;
+            }
+        }
+    }
+
+    // 4. MenuButton hooks for Chat Bubble "Hiện / Ẩn" in-place toggle (strictly non-mutating)
     Class menuBtnCls = NSClassFromString(@"MenuButton");
     if (menuBtnCls) {
         SEL showMenuSel = sel_registerName("showContextMenuViewWithMenuItemArray:hasReaction:");
@@ -1227,45 +1214,33 @@ void ZLModAntiRecallInstall(void) {
                     if ([[ZLModPreferences shared] boolForKey:kZLModAntiRecall]) {
                         id chat = ZLModSafeObjectProperty(selfObj, sel_registerName("chatEntity"));
                         if (chat) {
-                            int64_t gid = 0, cid = 0;
-                            NSString *tid = nil;
-                            ZLModExtractChatEntityFields(chat, nil, &gid, &cid, NULL, NULL, NULL, &tid, NULL);
-                            NSString *scope = ZLModCurrentAccountScope();
+                            ZLModMessageModel *m = [ZLModChatEntityAdapter modelFromChatEntity:chat fallbackThreadId:nil];
                             BOOL isRecalled = ZLModIsChatRecalled(chat);
-                            BOOL isUnhidden = ZLModIsMessageUnhidden(scope, tid, gid, cid);
+                            BOOL isUnhidden = m ? ZLModIsMessageUnhidden(m.accountScope, m.threadId, m.globalId, m.clientId) : NO;
 
                             if (isRecalled || isUnhidden) {
                                 NSMutableArray *mutableItems = [itemArray isKindOfClass:[NSArray class]]
                                     ? [itemArray mutableCopy]
                                     : [NSMutableArray array];
 
-                                NSIndexSet *existing = [mutableItems indexesOfObjectsPassingTest:^BOOL(id obj, NSUInteger idx, BOOL *stop) {
+                                NSIndexSet *existing = [mutableItems indexesOfObjectsPassingTest:^BOOL(id obj, __unused NSUInteger idx, __unused BOOL *stop) {
                                     NSInteger mt = (NSInteger)ZLModSafeInt64Property(obj, sel_registerName("menuType"), 0);
                                     return (mt == kZLModActionUnhideRecall || mt == kZLModActionHideRecall);
                                 }];
-                                if (existing.count > 0) {
-                                    [mutableItems removeObjectsAtIndexes:existing];
-                                }
+                                if (existing.count > 0) [mutableItems removeObjectsAtIndexes:existing];
 
                                 id template = mutableItems.firstObject;
-                                id menuItem = nil;
-                                if (isUnhidden) {
-                                    menuItem = ZLModMakeRecallMenuItem(template, @"Ẩn", @"eye.slash", kZLModActionHideRecall);
-                                } else {
-                                    menuItem = ZLModMakeRecallMenuItem(template, @"Hiện", @"eye", kZLModActionUnhideRecall);
-                                }
-                                if (menuItem) {
-                                    [mutableItems insertObject:menuItem atIndex:0];
-                                }
+                                id menuItem = isUnhidden
+                                    ? ZLModMakeRecallMenuItem(template, @"Ẩn", @"eye.slash", kZLModActionHideRecall)
+                                    : ZLModMakeRecallMenuItem(template, @"Hiện", @"eye", kZLModActionUnhideRecall);
+                                if (menuItem) [mutableItems insertObject:menuItem atIndex:0];
                                 finalArray = mutableItems;
                             }
                         }
                     }
                 } @catch (__unused NSException *e) {}
 
-                if (orig) {
-                    ((void (*)(id, SEL, id, BOOL))orig)(selfObj, showMenuSel, finalArray, hasReaction);
-                }
+                if (orig) ((void (*)(id, SEL, id, BOOL))orig)(selfObj, showMenuSel, finalArray, hasReaction);
             })) {
                 installed++;
             }
@@ -1277,42 +1252,41 @@ void ZLModAntiRecallInstall(void) {
             if (ZLModReplaceMethod(menuBtnCls, tapSel, 2, "v", ^(id selfObj, id menuView, NSInteger itemType) {
                 if (itemType == kZLModActionUnhideRecall) {
                     id chat = ZLModSafeObjectProperty(selfObj, sel_registerName("chatEntity"));
-                    int64_t gid = 0, cid = 0;
-                    NSString *tid = nil;
-                    ZLModExtractChatEntityFields(chat, nil, &gid, &cid, NULL, NULL, NULL, &tid, NULL);
-                    NSString *scope = ZLModCurrentAccountScope();
+                    ZLModMessageModel *m = [ZLModChatEntityAdapter modelFromChatEntity:chat fallbackThreadId:nil];
+                    int64_t gid = m ? m.globalId : 0;
+                    int64_t cid = m ? m.clientId : 0;
+                    NSString *tid = m ? m.threadId : nil;
+                    NSString *scope = m.accountScope.length > 0 ? m.accountScope : ZLModCurrentAccountScope();
+
                     ZLModSetMessageUnhidden(scope, tid, gid, cid, YES);
 
                     NSString *decrypted = ZLModResolveRecalledText(chat, gid, cid);
-                    UIImage *photo = ZLModExtractPhotoFromChat(chat);
+                    UIImage *photo = [[ZLModAntiRecallStore shared] preservedPhotoForGlobalId:gid clientId:cid];
+                    if (!photo) {
+                        photo = [ZLModChatEntityAdapter extractPhotoImageFromChatEntity:chat];
+                    }
 
                     NSString *displayText = decrypted.length > 0
                         ? decrypted
                         : (photo ? @"[Hình ảnh đã thu hồi]" : @"[Tin nhắn đã thu hồi]");
 
-                    // 1. Update text in-place in view hierarchy
+                    // Non-mutating in-place UI update + reloadCellIfNeed (never mutates ChatEntity properties/SQLite)
                     ZLModApplyRecallTextInPlace((UIView *)selfObj, displayText, YES);
-
-                    // 2. Update ChatEntity and trigger cell layout reload
                     if (chat) {
-                        SEL setOriginSel = sel_registerName("set_originTextRecallMsg:");
-                        if ([chat respondsToSelector:setOriginSel]) {
-                            ((void (*)(id, SEL, id))objc_msgSend)(chat, setOriginSel, displayText);
-                        }
                         SEL reloadSel = sel_registerName("reloadCellIfNeed");
                         if ([chat respondsToSelector:reloadSel]) {
                             ((void (*)(id, SEL))objc_msgSend)(chat, reloadSel);
                         }
                     }
 
-                    // 3. If photo, present preview modal so user can zoom/save/copy
                     if (photo) {
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        NSString *senderLabel = (m.senderName.length > 0) ? m.senderName : @"Ảnh đã thu hồi";
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                             UIViewController *top = ZLModTopPresenterViewController();
                             if (top) {
                                 ZLModPhotoPreviewViewController *pvc = [[ZLModPhotoPreviewViewController alloc] init];
                                 pvc.photo = photo;
-                                pvc.senderName = @"Ảnh đã thu hồi";
+                                pvc.senderName = senderLabel;
                                 pvc.modalPresentationStyle = UIModalPresentationFullScreen;
                                 [top presentViewController:pvc animated:YES completion:nil];
                             }
@@ -1329,18 +1303,15 @@ void ZLModAntiRecallInstall(void) {
 
                 if (itemType == kZLModActionHideRecall) {
                     id chat = ZLModSafeObjectProperty(selfObj, sel_registerName("chatEntity"));
-                    int64_t gid = 0, cid = 0;
-                    NSString *tid = nil;
-                    ZLModExtractChatEntityFields(chat, nil, &gid, &cid, NULL, NULL, NULL, &tid, NULL);
-                    NSString *scope = ZLModCurrentAccountScope();
+                    ZLModMessageModel *m = [ZLModChatEntityAdapter modelFromChatEntity:chat fallbackThreadId:nil];
+                    int64_t gid = m ? m.globalId : 0;
+                    int64_t cid = m ? m.clientId : 0;
+                    NSString *tid = m ? m.threadId : nil;
+                    NSString *scope = m.accountScope.length > 0 ? m.accountScope : ZLModCurrentAccountScope();
+
                     ZLModSetMessageUnhidden(scope, tid, gid, cid, NO);
+                    ZLModApplyRecallTextInPlace((UIView *)selfObj, @"Tin nhắn đã được thu hồi", NO);
 
-                    NSString *placeholder = @"Tin nhắn đã được thu hồi";
-
-                    // 1. In-place restore in view hierarchy
-                    ZLModApplyRecallTextInPlace((UIView *)selfObj, placeholder, NO);
-
-                    // 2. Update ChatEntity
                     if (chat) {
                         SEL reloadSel = sel_registerName("reloadCellIfNeed");
                         if ([chat respondsToSelector:reloadSel]) {
@@ -1356,9 +1327,7 @@ void ZLModAntiRecallInstall(void) {
                     return;
                 }
 
-                if (orig) {
-                    ((void (*)(id, SEL, id, NSInteger))orig)(selfObj, tapSel, menuView, itemType);
-                }
+                if (orig) ((void (*)(id, SEL, id, NSInteger))orig)(selfObj, tapSel, menuView, itemType);
             })) {
                 installed++;
             }

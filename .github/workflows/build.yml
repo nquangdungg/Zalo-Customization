@@ -90,6 +90,9 @@ jobs:
               --dylib build/libZLMod.dylib \
               --no-appex
 
+            python3 Packaging/ipa_preflight.py "build/Zalo-ZLMod-${ZLMOD_VERSION}-full-unsigned.ipa" --require-unencrypted-main
+            python3 Packaging/ipa_preflight.py "build/Zalo-ZLMod-${ZLMOD_VERSION}-noappex-unsigned.ipa" --require-unencrypted-main
+
             cd build
             shasum -a 256 *.ipa > ipa_checksums.sha256.txt || true
           else
@@ -120,11 +123,12 @@ jobs:
 
             - Targets: Zalo 26.10.02 (261002802) & 26.11.01 (261101802), vn.com.vng.zingalo / vn.com.vng.zingalo2, arm64, iOS 15.1+
             - Modules: ZLModCore, ZLModCompatibility, ZLModPreferences, ZLModHookEngine,
-              ZLModCryptoStore, ZLModPolicyStore, ZLModURIFilter, ZLModPrivacy,
-              ZLModConversationMenu, ZLModAntiRecall, ZLModUtilities, ZLModTheme,
-              ZLModAds, ZLModFeatures, ZLModSettings, ZLModUI, ZLModGlass, ZLModBridge
+              ZLModChatEntityAdapter, ZLModCryptoStore, ZLModOverlayUI, ZLModPolicyStore,
+              ZLModURIFilter, ZLModPrivacy, ZLModConversationMenu, ZLModMessageTap,
+              ZLModAntiRecall, ZLModUtilities, ZLModTheme, ZLModAds, ZLModFeatures,
+              ZLModSettings, ZLModUI, ZLModGlass, ZLModBridge
             - Verification gates passed: arm64, deps clean (no substrate),
-              install_name, minos 15.1, UIGlassEffect runtime-guarded, codesigned
+              install_name, minos 15.1, Mach-O 8-byte alignment, codesigned
             - See IMPLEMENTATION-REPORT.md and COMPATIBILITY-REPORT.md
 
             Not ported by design (no usable iOS mechanism / server-authoritative / unsafe):
@@ -134,5 +138,7 @@ jobs:
             build/ZLMod-*.zip
             build/libZLMod.dylib
             build/libZLMod.dylib.sha256
+            build/*.ipa
+            build/*.sha256.txt
             build/IMPLEMENTATION-REPORT.md
             build/COMPATIBILITY-REPORT.md

@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 
 
-FORBIDDEN = ("Zync", "ZYNC", "zync")
+FORBIDDEN = ("Zync", "ZYNC", "zync", "ZyForce")
 SCANNED_FILES = {"Makefile", "README.md"}
 SCANNED_DIRS = ("Sources", "Scripts", "Packaging", ".github")
 

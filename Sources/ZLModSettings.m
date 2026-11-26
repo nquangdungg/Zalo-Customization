@@ -1,26 +1,15 @@
-// language: Objective-C, file: ZLModSettings.m, target: iOS 15.1+ (Zalo 26.11.01, arm64)
-// Native Settings integration — injects "ZLMod Customize" as a cloned sibling of
-// the "Account and security" row inside SettingUI40TableViewController (the
-// settings hub class that owns accountAndSecurityObject / _accountAndSecurityObject).
-//
-// Primary tier: deep-copy the real cell object, retitle it, insert it directly
-// above "Account and security" in the arranged content, and intercept row
-// selection to push the ZLMod dashboard. The row that ships is a genuine Zalo
-// cell object — identical height, padding, typography, separator and behaviour.
-//
-// Fallback tier (only if the model cannot be reached): one extra row injected
-// via numberOfRows/cellForRow interception using a Zalo cell class when it can
-// be instantiated, otherwise a standard grouped cell.
+// language: Objective-C, file: ZLModSettings.m, target: iOS 15.1+ (Zalo 26.10.02 & 26.11.01, arm64)
+// Safe Native Settings Integration (MODULE 04):
+//   - Per-VC associated state (no stale static globals across recreated controllers).
+//   - Safe property-based cloning (copyWithZone: / declared ObjC properties only — ZERO raw memcpy/CFRetain).
+//   - Zero-index-shift fallback via UINavigationItem bar button (never shifts UITableView indexPaths).
+//   - Configurable Shake Gesture respecting kZLModDisableShakeToOpen and active text input (Undo Typing safe).
 
 #import "ZLMod.h"
 
-#pragma mark - State
-
-static id gOurRow = nil;
-static NSArray<NSArray *> *gSectionSnapshot = nil;
-static BOOL gSnapshotAligned = NO;
-static BOOL gFallbackActive = NO;
-static NSUInteger gInjectAttempts = 0;
+static const void *kZLModSettingsVCStateAssocKey = &kZLModSettingsVCStateAssocKey;
+static const NSUInteger kZLModMaxSafeBFNodes = 1500;
+static const NSUInteger kZLModMaxSafeBFDepth = 5;
 static Class gSettingsClass = Nil;
 
 static NSArray<NSString *> *ZLModKnownAccountTitleValues(void) {
@@ -31,129 +20,160 @@ static NSArray<NSString *> *ZLModKnownAccountTitleValues(void) {
              @"tabme_account_security"];
 }
 
-static void ZLModEnsureRow(id vc);
-static char ZLModRetryCountKey;
-static const NSUInteger kZLModMaxBFNodes = 4000;
+#pragma mark - Per-VC Associated State
 
-// class_copyIvarList only returns ivars declared on the exact class — model,
-// cell and category state in Zalo lives on superclasses (e.g. model/actions
-// on BasicSettingTableViewController, title on BasicSettingCellV2Object
-// parents). Walk the full chain so discovery, cloning and retitling all see
-// inherited state.
-static NSArray<NSValue *> *ZLModAllIvars(Class cls) {
-    NSMutableArray<NSValue *> *list = [NSMutableArray array];
-    Class current = cls;
-    while (current && current != [NSObject class]) {
-        unsigned int count = 0;
-        Ivar *ivars = class_copyIvarList(current, &count);
-        for (unsigned int i = 0; i < count; i++) {
-            [list addObject:[NSValue valueWithPointer:(void *)ivars[i]]];
-        }
-        free(ivars);
-        current = class_getSuperclass(current);
+@interface ZLModSettingsVCState : NSObject
+@property (nonatomic, strong) id injectedRow;
+@property (nonatomic, strong) NSArray<NSArray *> *sectionSnapshot;
+@property (nonatomic, assign) BOOL snapshotAligned;
+@property (nonatomic, assign) BOOL navFallbackInstalled;
+@property (nonatomic, assign) NSInteger retryCount;
+@end
+
+@implementation ZLModSettingsVCState
+@end
+
+static ZLModSettingsVCState *ZLModStateForSettingsVC(id vc) {
+    if (!vc) return nil;
+    ZLModSettingsVCState *state = objc_getAssociatedObject(vc, kZLModSettingsVCStateAssocKey);
+    if (!state) {
+        state = [[ZLModSettingsVCState alloc] init];
+        objc_setAssociatedObject(vc, kZLModSettingsVCStateAssocKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    return list;
+    return state;
 }
 
-#pragma mark - Object cloning
+#pragma mark - Safe Property-Based Cloning (Zero raw memcpy / CFRetain)
 
-// object_setIvar does not retain; ARC-managed ivars will release on dealloc.
-// Retain once here so the clone owns exactly one reference, like a normal assignment.
-static void ZLModSetIvarRetained(id object, Ivar ivar, id value) {
-    if (value) CFRetain((__bridge CFTypeRef)value);
-    object_setIvar(object, ivar, value);
-}
-
-static id ZLModCloneCellObject(id source) {
+static id ZLModSafeCloneCellObject(id source) {
     if (!source) return nil;
     Class cls = object_getClass(source);
     if (!cls) return nil;
 
-    // NSObject's default copyWithZone: returns self — only a real copy helps.
+    // 1. Prefer genuine NSCopying implementation if it returns a distinct instance.
     if ([source respondsToSelector:@selector(copyWithZone:)]) {
         @try {
             id copy = [source copy];
-            if (copy && copy != source && object_getClass(copy) == cls) return copy;
+            if (copy && copy != source && object_getClass(copy) == cls) {
+                return copy;
+            }
         } @catch (__unused NSException *e) {}
     }
 
+    // 2. Safe KVC property copy across class hierarchy using declared ObjC properties only.
     id clone = nil;
-    @try { clone = [[cls alloc] init]; } @catch (__unused NSException *e) { return nil; }
+    @try {
+        clone = [[cls alloc] init];
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
     if (!clone) return nil;
 
-    for (NSValue *boxed in ZLModAllIvars(cls)) {
-        Ivar ivar = (Ivar)boxed.pointerValue;
-        const char *type = ivar_getTypeEncoding(ivar);
-        if (!type || type[0] == '\0') continue;
-        if (type[0] == '@') {
-            @try {
-                id value = object_getIvar(source, ivar);
-                if (value) ZLModSetIvarRetained(clone, ivar, value);
-            } @catch (__unused NSException *e) {}
-        } else {
-            NSUInteger size = 0;
-            NSGetSizeAndAlignment(type, &size, NULL);
-            if (size > 0 && size <= 64) {
-                ptrdiff_t offset = ivar_getOffset(ivar);
-                memcpy((uint8_t *)(__bridge void *)clone + offset,
-                       (const uint8_t *)(__bridge const void *)source + offset, size);
+    Class cursor = cls;
+    while (cursor && cursor != [NSObject class]) {
+        unsigned int propCount = 0;
+        objc_property_t *props = class_copyPropertyList(cursor, &propCount);
+        for (unsigned int i = 0; i < propCount; i++) {
+            const char *rawName = property_getName(props[i]);
+            if (!rawName || rawName[0] == '\0') continue;
+
+            // Skip readonly or weak properties to preserve ARC invariants.
+            const char *attrs = property_getAttributes(props[i]);
+            if (attrs && (strstr(attrs, ",R") != NULL || strstr(attrs, ",W") != NULL)) {
+                continue;
             }
+
+            NSString *propName = [NSString stringWithUTF8String:rawName];
+            if (propName.length == 0) continue;
+
+            SEL getterSel = NSSelectorFromString(propName);
+            NSString *setterName = [NSString stringWithFormat:@"set%@%@:",
+                                    [[propName substringToIndex:1] uppercaseString],
+                                    [propName substringFromIndex:1]];
+            SEL setterSel = NSSelectorFromString(setterName);
+
+            if (![source respondsToSelector:getterSel] || ![clone respondsToSelector:setterSel]) {
+                continue;
+            }
+
+            @try {
+                id val = [source valueForKey:propName];
+                if (val && val != [NSNull null]) {
+                    [clone setValue:val forKey:propName];
+                }
+            } @catch (__unused NSException *e) {}
         }
+        if (props) free(props);
+        cursor = class_getSuperclass(cursor);
     }
     return clone;
 }
 
-static BOOL ZLModRetitleCellObject(id object, NSString *newTitle, NSString **outOldValue) {
-    if (!object) return NO;
+static BOOL ZLModSafeRetitleCellObject(id object, NSString *newTitle, NSString **outOldValue) {
+    if (!object || newTitle.length == 0) return NO;
     NSArray<NSString *> *known = ZLModKnownAccountTitleValues();
-    Class cls = object_getClass(object);
-    BOOL done = NO;
-    for (NSValue *boxed in ZLModAllIvars(cls)) {
-        if (done) break;
-        Ivar ivar = (Ivar)boxed.pointerValue;
-        const char *type = ivar_getTypeEncoding(ivar);
-        if (!type || type[0] != '@') continue;
-        id value = nil;
-        @try { value = object_getIvar(object, ivar); } @catch (__unused NSException *e) { continue; }
-        if (![value isKindOfClass:[NSString class]]) continue;
-        if ([known containsObject:value]) {
-            if (outOldValue) *outOldValue = value;
-            @try { ZLModSetIvarRetained(object, ivar, newTitle); } @catch (__unused NSException *e) { continue; }
-            done = YES;
-        }
+
+    NSArray<NSString *> *titleKeys = @[
+        @"title", @"name", @"text", @"cellTitle", @"localizedTitle", @"mainTitle"
+    ];
+    for (NSString *key in titleKeys) {
+        @try {
+            id value = [object valueForKey:key];
+            if ([value isKindOfClass:[NSString class]]) {
+                NSString *strVal = (NSString *)value;
+                if ([known containsObject:strVal] ||
+                    [strVal localizedCaseInsensitiveContainsString:@"account_security"] ||
+                    [strVal localizedCaseInsensitiveContainsString:@"tài khoản và bảo mật"]) {
+                    if (outOldValue) *outOldValue = strVal;
+                    [object setValue:newTitle forKey:key];
+                    return YES;
+                }
+            }
+        } @catch (__unused NSException *e) {}
     }
 
-    if (!done) {
-        for (NSString *key in @[@"title", @"name", @"text", @"cellTitle", @"localizedTitle"]) {
+    // Fallback: scan declared NSString properties with safe setter.
+    Class cursor = object_getClass(object);
+    while (cursor && cursor != [NSObject class]) {
+        unsigned int count = 0;
+        objc_property_t *props = class_copyPropertyList(cursor, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *attrs = property_getAttributes(props[i]);
+            if (!attrs || strstr(attrs, ",R") != NULL || strstr(attrs, "NSString") == NULL) continue;
+            const char *rawName = property_getName(props[i]);
+            if (!rawName) continue;
+            NSString *propName = [NSString stringWithUTF8String:rawName];
             @try {
-                id value = [object valueForKey:key];
-                if ([value isKindOfClass:[NSString class]] &&
-                    ([ZLModKnownAccountTitleValues() containsObject:value] || [value containsString:@"account_security"])) {
-                    [object setValue:newTitle forKey:key];
-                    done = YES;
-                    break;
+                id val = [object valueForKey:propName];
+                if ([val isKindOfClass:[NSString class]] && [known containsObject:(NSString *)val]) {
+                    if (outOldValue) *outOldValue = (NSString *)val;
+                    [object setValue:newTitle forKey:propName];
+                    free(props);
+                    return YES;
                 }
             } @catch (__unused NSException *e) {}
         }
+        if (props) free(props);
+        cursor = class_getSuperclass(cursor);
     }
-    return done;
+    return NO;
 }
 
-#pragma mark - Model discovery
+#pragma mark - Bounded Model Discovery
 
-@interface ZLModBFSNode : NSObject
+@interface ZLModSettingsBFSNode : NSObject
 @property (nonatomic, strong) id node;
 @property (nonatomic, strong) id parent;
-@property (nonatomic, strong) ZLModBFSNode *parentEntry;
+@property (nonatomic, strong) ZLModSettingsBFSNode *parentEntry;
 @property (nonatomic, assign) NSUInteger indexInParent;
 @property (nonatomic, strong) id keyInParent;
-@property (nonatomic, assign) Ivar parentIvar;
+@property (nonatomic, copy) NSString *parentPropertyName;
 @end
 
-@implementation ZLModBFSNode
+@implementation ZLModSettingsBFSNode
 @end
 
-static BOOL ZLModSkipTraversalClass(id node) {
+static BOOL ZLModShouldSkipSettingsNode(id node) {
     return [node isKindOfClass:[NSString class]] || [node isKindOfClass:[NSNumber class]] ||
            [node isKindOfClass:[NSData class]] || [node isKindOfClass:[NSDate class]] ||
            [node isKindOfClass:[NSURL class]] || [node isKindOfClass:[NSSet class]] ||
@@ -161,32 +181,33 @@ static BOOL ZLModSkipTraversalClass(id node) {
            [node isKindOfClass:[UIView class]] || [node isKindOfClass:[UIViewController class]];
 }
 
-static NSMutableArray<ZLModBFSNode *> *ZLModCollectCandidates(id root, NSUInteger maxDepth) {
-    NSMutableArray<ZLModBFSNode *> *all = [NSMutableArray array];
-    NSMutableArray<ZLModBFSNode *> *queue = [NSMutableArray array];
+static NSMutableArray<ZLModSettingsBFSNode *> *ZLModCollectSettingsNodes(id root, NSUInteger maxDepth) {
+    NSMutableArray<ZLModSettingsBFSNode *> *all = [NSMutableArray array];
+    NSMutableArray<ZLModSettingsBFSNode *> *queue = [NSMutableArray array];
     NSMutableSet<NSValue *> *seen = [NSMutableSet set];
 
-    ZLModBFSNode *rootNode = [ZLModBFSNode new];
+    ZLModSettingsBFSNode *rootNode = [ZLModSettingsBFSNode new];
     rootNode.node = root;
     [queue addObject:rootNode];
 
     NSUInteger depth = 0;
-    while (queue.count > 0 && depth < maxDepth && all.count < kZLModMaxBFNodes) {
-        NSMutableArray<ZLModBFSNode *> *next = [NSMutableArray array];
-        for (ZLModBFSNode *entry in queue) {
+    while (queue.count > 0 && depth < maxDepth && all.count < kZLModMaxSafeBFNodes) {
+        NSMutableArray<ZLModSettingsBFSNode *> *next = [NSMutableArray array];
+        for (ZLModSettingsBFSNode *entry in queue) {
+            if (all.count >= kZLModMaxSafeBFNodes) break;
             id node = entry.node;
-            if (!node || ZLModSkipTraversalClass(node)) continue;
+            if (!node || ZLModShouldSkipSettingsNode(node)) continue;
             NSValue *ptr = [NSValue valueWithPointer:(__bridge const void *)node];
             if ([seen containsObject:ptr]) continue;
             [seen addObject:ptr];
             [all addObject:entry];
 
             if ([node isKindOfClass:[NSArray class]]) {
-                NSArray *array = node;
+                NSArray *array = (NSArray *)node;
                 for (NSUInteger i = 0; i < array.count; i++) {
                     id child = array[i];
-                    if (!child || ZLModSkipTraversalClass(child)) continue;
-                    ZLModBFSNode *n = [ZLModBFSNode new];
+                    if (!child || ZLModShouldSkipSettingsNode(child)) continue;
+                    ZLModSettingsBFSNode *n = [ZLModSettingsBFSNode new];
                     n.node = child;
                     n.parent = node;
                     n.parentEntry = entry;
@@ -194,11 +215,11 @@ static NSMutableArray<ZLModBFSNode *> *ZLModCollectCandidates(id root, NSUIntege
                     [next addObject:n];
                 }
             } else if ([node isKindOfClass:[NSDictionary class]]) {
-                NSDictionary *dict = node;
+                NSDictionary *dict = (NSDictionary *)node;
                 for (id key in dict) {
                     id child = dict[key];
-                    if (!child || ZLModSkipTraversalClass(child)) continue;
-                    ZLModBFSNode *n = [ZLModBFSNode new];
+                    if (!child || ZLModShouldSkipSettingsNode(child)) continue;
+                    ZLModSettingsBFSNode *n = [ZLModSettingsBFSNode new];
                     n.node = child;
                     n.parent = node;
                     n.parentEntry = entry;
@@ -206,19 +227,28 @@ static NSMutableArray<ZLModBFSNode *> *ZLModCollectCandidates(id root, NSUIntege
                     [next addObject:n];
                 }
             } else {
-                for (NSValue *boxed in ZLModAllIvars(object_getClass(node))) {
-                    Ivar ivar = (Ivar)boxed.pointerValue;
-                    const char *type = ivar_getTypeEncoding(ivar);
-                    if (!type || type[0] != '@') continue;
-                    id child = nil;
-                    @try { child = object_getIvar(node, ivar); } @catch (__unused NSException *e) { continue; }
-                    if (!child || ZLModSkipTraversalClass(child)) continue;
-                    ZLModBFSNode *n = [ZLModBFSNode new];
-                    n.node = child;
-                    n.parent = node;
-                    n.parentEntry = entry;
-                    n.parentIvar = ivar;
-                    [next addObject:n];
+                Class cursor = object_getClass(node);
+                while (cursor && cursor != [NSObject class]) {
+                    unsigned int propCount = 0;
+                    objc_property_t *props = class_copyPropertyList(cursor, &propCount);
+                    for (unsigned int i = 0; i < propCount; i++) {
+                        const char *attrs = property_getAttributes(props[i]);
+                        if (!attrs || attrs[1] != '@') continue;
+                        const char *rawName = property_getName(props[i]);
+                        if (!rawName) continue;
+                        NSString *propName = [NSString stringWithUTF8String:rawName];
+                        id child = nil;
+                        @try { child = [node valueForKey:propName]; } @catch (__unused NSException *e) { continue; }
+                        if (!child || ZLModShouldSkipSettingsNode(child)) continue;
+                        ZLModSettingsBFSNode *n = [ZLModSettingsBFSNode new];
+                        n.node = child;
+                        n.parent = node;
+                        n.parentEntry = entry;
+                        n.parentPropertyName = propName;
+                        [next addObject:n];
+                    }
+                    if (props) free(props);
+                    cursor = class_getSuperclass(cursor);
                 }
             }
         }
@@ -228,42 +258,34 @@ static NSMutableArray<ZLModBFSNode *> *ZLModCollectCandidates(id root, NSUIntege
     return all;
 }
 
-// Places `value` into the slot that currently holds `child.node` (parent object
-// via ivar, or parent collection via index/key). Returns NO when the parent is
-// an immutable collection (caller must climb one level and retry with a copy).
-static BOOL ZLModPlaceValue(id value, ZLModBFSNode *child) {
+static BOOL ZLModPlaceSettingsValue(id value, ZLModSettingsBFSNode *child) {
     id parent = child.parent;
     @try {
         if ([parent isKindOfClass:[NSMutableArray class]]) {
             [(NSMutableArray *)parent replaceObjectAtIndex:child.indexInParent withObject:value];
             return YES;
         }
-        if ([parent isKindOfClass:[NSMutableDictionary class]]) {
+        if ([parent isKindOfClass:[NSMutableDictionary class]] && child.keyInParent) {
             [(NSMutableDictionary *)parent setObject:value forKey:child.keyInParent];
             return YES;
         }
-        if (child.parentIvar != NULL) {
-            ZLModSetIvarRetained(parent, child.parentIvar, value);
+        if (child.parentPropertyName.length > 0) {
+            [parent setValue:value forKey:child.parentPropertyName];
             return YES;
         }
     } @catch (__unused NSException *e) {}
     return NO;
 }
 
-// Walks up from the matched array, converting every immutable ancestor
-// (array/dictionary) into a mutable copy that is re-linked into its own parent,
-// so the returned NSMutableArray is reachable from the live object graph.
-static NSMutableArray *ZLModMakeMutableChain(ZLModBFSNode *match) {
+static NSMutableArray *ZLModMakeMutableSettingsChain(ZLModSettingsBFSNode *match) {
     id node = match.node;
     if (![node isKindOfClass:[NSArray class]]) return nil;
-
     id value = [node isKindOfClass:[NSMutableArray class]] ? node : [node mutableCopy];
     if (![value isKindOfClass:[NSMutableArray class]]) return nil;
 
-    ZLModBFSNode *child = match;
+    ZLModSettingsBFSNode *child = match;
     while (child) {
-        if (ZLModPlaceValue(value, child)) return (NSMutableArray *)value;
-
+        if (ZLModPlaceSettingsValue(value, child)) return (NSMutableArray *)value;
         id parent = child.parent;
         if (![parent isKindOfClass:[NSArray class]] && ![parent isKindOfClass:[NSDictionary class]]) return nil;
         id newParent = [parent mutableCopy];
@@ -281,330 +303,252 @@ static NSMutableArray *ZLModMakeMutableChain(ZLModBFSNode *match) {
     return nil;
 }
 
-static NSMutableArray *ZLModFindContainerForObject(id root, id target, NSUInteger *outIndex) {
-    NSMutableArray<ZLModBFSNode *> *nodes = ZLModCollectCandidates(root, 7);
-    for (ZLModBFSNode *entry in nodes) {
-        id node = entry.node;
-        if (![node isKindOfClass:[NSArray class]]) continue;
-        if ([node indexOfObjectIdenticalTo:target] == NSNotFound) continue;
-
-        NSMutableArray *container = ZLModMakeMutableChain(entry);
-        if (!container) continue;
-        if (outIndex) *outIndex = [container indexOfObjectIdenticalTo:target];
-        ZLMOD_LOG(@"ensure: container found via ivar graph");
-        return container;
-    }
-
-    // Stage 2: arranged content may come from a getter (getArrangedTableContent),
-    // not a stored ivar. Only mutate when a containing array is reachable and
-    // mutable-ized via the existing chain logic — a throwaway copy is ignored.
-    SEL arrangedSel = sel_registerName("getArrangedTableContent");
-    if (root && [root respondsToSelector:arrangedSel]) {
-        id arranged = nil;
-        @try { IMP arrangedImp = [root methodForSelector:arrangedSel]; if (arrangedImp) arranged = ((id (*)(id, SEL))arrangedImp)(root, arrangedSel); } @catch (__unused NSException *e) {}
-        if (arranged && arranged != root) {
-            if ([arranged isKindOfClass:[NSMutableArray class]] &&
-                [arranged indexOfObjectIdenticalTo:target] != NSNotFound) {
-                if (outIndex) *outIndex = [arranged indexOfObjectIdenticalTo:target];
-                ZLMOD_LOG(@"ensure: container via getArrangedTableContent (mutable root)");
-                return arranged;
-            }
-            NSMutableArray<ZLModBFSNode *> *subNodes = ZLModCollectCandidates(arranged, 4);
-            for (ZLModBFSNode *entry in subNodes) {
-                id node = entry.node;
-                if (![node isKindOfClass:[NSArray class]]) continue;
-                if ([node indexOfObjectIdenticalTo:target] == NSNotFound) continue;
-                NSMutableArray *container = ZLModMakeMutableChain(entry);
-                if (!container) continue;
-                if (outIndex) *outIndex = [container indexOfObjectIdenticalTo:target];
-                ZLMOD_LOG(@"ensure: container via getArrangedTableContent");
-                return container;
-            }
-            ZLMOD_LOG(@"ensure: getArrangedTableContent reachable but no mutable container");
-        }
-    }
-    ZLMOD_LOG(@"ensure: container not found");
-    return nil;
-}
-
 static id ZLModFetchAccountObject(id vc) {
     if (!vc) return nil;
     @try {
-        id value = [vc valueForKey:@"accountAndSecurityObject"];
-        if (value) return value;
+        id val = [vc valueForKey:@"accountAndSecurityObject"];
+        if (val) return val;
     } @catch (__unused NSException *e) {}
+    return nil;
+}
 
-    for (NSValue *boxed in ZLModAllIvars(object_getClass(vc))) {
-        Ivar ivar = (Ivar)boxed.pointerValue;
-        const char *name = ivar_getName(ivar);
-        if (name && strcmp(name, "_accountAndSecurityObject") == 0) {
-            id found = nil;
-            @try { found = object_getIvar(vc, ivar); } @catch (__unused NSException *e) {}
-            return found;
+static NSMutableArray *ZLModFindContainerForAccountObject(id vc, id target, NSUInteger *outIndex) {
+    if (!vc || !target) return nil;
+    // Stage 1: Direct getter getArrangedTableContent (fast, avoids deep BFS)
+    SEL arrangedSel = sel_registerName("getArrangedTableContent");
+    if ([vc respondsToSelector:arrangedSel]) {
+        id arranged = nil;
+        @try {
+            IMP imp = [vc methodForSelector:arrangedSel];
+            if (imp) arranged = ((id (*)(id, SEL))imp)(vc, arrangedSel);
+        } @catch (__unused NSException *e) {}
+        if ([arranged isKindOfClass:[NSMutableArray class]] &&
+            [arranged indexOfObjectIdenticalTo:target] != NSNotFound) {
+            if (outIndex) *outIndex = [arranged indexOfObjectIdenticalTo:target];
+            return arranged;
+        }
+        if (arranged && arranged != vc) {
+            for (ZLModSettingsBFSNode *entry in ZLModCollectSettingsNodes(arranged, 4)) {
+                if ([entry.node isKindOfClass:[NSArray class]] &&
+                    [(NSArray *)entry.node indexOfObjectIdenticalTo:target] != NSNotFound) {
+                    NSMutableArray *container = ZLModMakeMutableSettingsChain(entry);
+                    if (container) {
+                        if (outIndex) *outIndex = [container indexOfObjectIdenticalTo:target];
+                        return container;
+                    }
+                }
+            }
+        }
+    }
+
+    // Stage 2: Bounded property graph BFS on vc
+    for (ZLModSettingsBFSNode *entry in ZLModCollectSettingsNodes(vc, kZLModMaxSafeBFDepth)) {
+        if ([entry.node isKindOfClass:[NSArray class]] &&
+            [(NSArray *)entry.node indexOfObjectIdenticalTo:target] != NSNotFound) {
+            NSMutableArray *container = ZLModMakeMutableSettingsChain(entry);
+            if (container) {
+                if (outIndex) *outIndex = [container indexOfObjectIdenticalTo:target];
+                return container;
+            }
         }
     }
     return nil;
 }
 
-#pragma mark - Snapshot (for row mapping)
+static UITableView *ZLModTableViewForVC(id vc) {
+    if ([vc isKindOfClass:[UITableViewController class]]) {
+        return [(UITableViewController *)vc tableView];
+    }
+    if ([vc isKindOfClass:[UIViewController class]]) {
+        for (UIView *sub in [(UIViewController *)vc view].subviews) {
+            if ([sub isKindOfClass:[UITableView class]]) return (UITableView *)sub;
+        }
+    }
+    return nil;
+}
 
-static void ZLModRefreshSnapshot(id vc) {
+static void ZLModRefreshSnapshotForVC(id vc, ZLModSettingsVCState *state) {
     NSMutableArray<NSArray *> *sections = [NSMutableArray array];
-    NSMutableArray<ZLModBFSNode *> *nodes = ZLModCollectCandidates(vc, 7);
-    for (ZLModBFSNode *entry in nodes) {
-        id node = entry.node;
-        if (![node isKindOfClass:[NSArray class]]) continue;
-        NSArray *array = node;
+    for (ZLModSettingsBFSNode *entry in ZLModCollectSettingsNodes(vc, kZLModMaxSafeBFDepth)) {
+        if (![entry.node isKindOfClass:[NSArray class]]) continue;
+        NSArray *array = (NSArray *)entry.node;
         if (array.count == 0) continue;
         BOOL cellObjectLike = YES;
         for (id element in array) {
-            if ([element isKindOfClass:[NSArray class]] || [element isKindOfClass:[NSDictionary class]]) { cellObjectLike = NO; break; }
+            if ([element isKindOfClass:[NSArray class]] || [element isKindOfClass:[NSDictionary class]]) {
+                cellObjectLike = NO;
+                break;
+            }
             NSString *clsName = NSStringFromClass(object_getClass(element));
-            if (!([clsName containsString:@"CellObject"] || [clsName containsString:@"Object"])) { cellObjectLike = NO; break; }
+            if (!([clsName containsString:@"CellObject"] || [clsName containsString:@"Object"])) {
+                cellObjectLike = NO;
+                break;
+            }
         }
         if (cellObjectLike) [sections addObject:array];
     }
-    gSectionSnapshot = sections;
+    state.sectionSnapshot = [sections copy];
+    state.snapshotAligned = NO;
 
-    gSnapshotAligned = NO;
-    if ([vc isKindOfClass:[UITableViewController class]]) {
-        UITableView *tv = [(UITableViewController *)vc tableView];
-        NSInteger sectionCount = [tv numberOfSections];
-        if (sectionCount == (NSInteger)sections.count) {
-            gSnapshotAligned = YES;
-            for (NSInteger s = 0; s < sectionCount; s++) {
-                if ([tv numberOfRowsInSection:s] != (NSInteger)sections[(NSUInteger)s].count) {
-                    gSnapshotAligned = NO;
-                    break;
-                }
+    UITableView *tv = ZLModTableViewForVC(vc);
+    if (tv && [tv numberOfSections] == (NSInteger)sections.count) {
+        state.snapshotAligned = YES;
+        for (NSInteger s = 0; s < (NSInteger)sections.count; s++) {
+            if ([tv numberOfRowsInSection:s] != (NSInteger)sections[(NSUInteger)s].count) {
+                state.snapshotAligned = NO;
+                break;
             }
         }
     }
 }
 
-#pragma mark - Injection
+#pragma mark - Zero-Index-Shift Navigation Bar Entry (Safe Fallback)
 
-static BOOL ZLModInjectRow(id vc) {
-    if (gOurRow) return YES;
-    id accountObject = ZLModFetchAccountObject(vc);
-    ZLMOD_LOG(@"ensure: accountObject=%@",
-             accountObject ? NSStringFromClass(object_getClass(accountObject)) : @"<nil>");
-    if (!accountObject) return NO;
+@interface ZLModNavBarTrigger : NSObject
+@property (nonatomic, weak) UIViewController *hostVC;
+- (void)openDashboard:(id)sender;
+@end
 
-    NSUInteger accountIndex = 0;
-    NSMutableArray *container = ZLModFindContainerForObject(vc, accountObject, &accountIndex);
-    ZLMOD_LOG(@"ensure: container=%@ count=%lu index=%lu",
-             container ? NSStringFromClass(object_getClass(container)) : @"<nil>",
-             (unsigned long)container.count, (unsigned long)accountIndex);
-    if (!container) return NO;
-
-    id clone = ZLModCloneCellObject(accountObject);
-    ZLMOD_LOG(@"ensure: clone=%@", clone ? NSStringFromClass(object_getClass(clone)) : @"<nil>");
-    if (!clone) return NO;
-    NSString *oldTitle = nil;
-    if (!ZLModRetitleCellObject(clone, @"ZLMod Customize", &oldTitle)) {
-        ZLMOD_LOG(@"ensure: retitle failed (old=%@) — row not injected", oldTitle ? oldTitle : @"<nil>");
-        return NO;
+@implementation ZLModNavBarTrigger
+- (void)openDashboard:(__unused id)sender {
+    UIViewController *host = self.hostVC ?: ZLModTopPresenterViewController();
+    if (host) {
+        [ZLModSettingsViewController pushFrom:host];
     }
-    ZLMOD_LOG(@"ensure: retitled %@ -> ZLMod Customize", oldTitle ? oldTitle : @"<unknown>");
-
-    NSUInteger insertIndex = MIN(accountIndex, container.count);
-    @try {
-        [container insertObject:clone atIndex:insertIndex];
-    } @catch (__unused NSException *e) {
-        ZLMOD_LOG(@"ensure: insert threw");
-        return NO;
-    }
-
-    gOurRow = clone;
-    gFallbackActive = NO;
-    ZLModRefreshSnapshot(vc);
-    BOOL visibleInSnapshot = NO;
-    if (gSectionSnapshot) {
-        for (NSArray *array in gSectionSnapshot) {
-            if ([array indexOfObjectIdenticalTo:gOurRow] != NSNotFound) { visibleInSnapshot = YES; break; }
-        }
-    }
-    ZLMOD_LOG(@"ensure: ZLMod Customize row injected at index %lu (visible-in-snapshot=%d)",
-             (unsigned long)insertIndex, visibleInSnapshot);
-    return YES;
 }
+@end
 
-static void ZLModReloadTable(id vc) {
-    if (![NSThread isMainThread]) {
-        __weak id weakVC = vc;
-        dispatch_async(dispatch_get_main_queue(), ^{ ZLModReloadTable(weakVC); });
-        return;
-    }
-    UITableView *tv = nil;
-    if ([vc isKindOfClass:[UITableViewController class]]) {
-        tv = [(UITableViewController *)vc tableView];
-    } else if ([vc isKindOfClass:[UIViewController class]]) {
-        NSArray *subviews = [[(UIViewController *)vc view] subviews];
-        for (UIView *view in subviews) {
-            if ([view isKindOfClass:[UITableView class]]) { tv = (UITableView *)view; break; }
+static const void *kZLModNavTriggerAssocKey = &kZLModNavTriggerAssocKey;
+
+static void ZLModInstallSafeNavBarEntry(UIViewController *vc, ZLModSettingsVCState *state) {
+    if (![vc isKindOfClass:[UIViewController class]] || state.navFallbackInstalled) return;
+    UINavigationItem *navItem = vc.navigationItem;
+    if (!navItem) return;
+
+    for (UIBarButtonItem *item in navItem.rightBarButtonItems) {
+        if (item.tag == kZLModSettingsButtonTag) {
+            state.navFallbackInstalled = YES;
+            return;
         }
     }
-    if (tv) [tv reloadData];
-}
 
-static UITableView *ZLModTableViewForVC(id vc) {
-    if (!vc) return nil;
-    UITableView *tv = nil;
-    if ([vc isKindOfClass:[UITableViewController class]]) {
-        tv = [(UITableViewController *)vc tableView];
-    } else if ([vc isKindOfClass:[UIViewController class]]) {
-        NSArray *subviews = [[(UIViewController *)vc view] subviews];
-        for (UIView *view in subviews) {
-            if ([view isKindOfClass:[UITableView class]]) { tv = (UITableView *)view; break; }
-        }
-    }
-    return tv;
-}
+    ZLModNavBarTrigger *trigger = [[ZLModNavBarTrigger alloc] init];
+    trigger.hostVC = vc;
+    objc_setAssociatedObject(vc, kZLModNavTriggerAssocKey, trigger, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-static BOOL ZLModTableReady(id vc) {
-    UITableView *tv = nil;
-    if ([vc isKindOfClass:[UITableViewController class]]) {
-        tv = [(UITableViewController *)vc tableView];
-    }
-    return tv != nil && [tv numberOfSections] > 0;
-}
-
-static void ZLModScheduleRetry(id vc) {
-    if (gOurRow || gFallbackActive) return;
-    NSNumber *doneNum = objc_getAssociatedObject(vc, &ZLModRetryCountKey);
-    NSInteger tries = doneNum ? doneNum.integerValue : 0;
-    if (tries >= 2) return;
-    objc_setAssociatedObject(vc, &ZLModRetryCountKey, @(tries + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    NSTimeInterval delay = tries == 0 ? 1.0 : 3.0;
-    ZLMOD_LOG(@"ensure: retry %ld in %.0fs", (long)(tries + 1), delay);
-    __weak id weakVC = vc;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (weakVC && !gOurRow && !gFallbackActive) {
-            @try { ZLModEnsureRow(weakVC); } @catch (__unused NSException *e) {}
-        }
-    });
-}
-
-static void ZLModEnsureRow(id vc) {
-    if (!vc) return;
-    if (gOurRow) {
-        // Re-insert if the model was rebuilt without our row.
-        BOOL stillPresent = NO;
-        if (gSectionSnapshot) {
-            for (NSArray *array in gSectionSnapshot) {
-                if ([array indexOfObjectIdenticalTo:gOurRow] != NSNotFound) { stillPresent = YES; break; }
-            }
-        }
-        if (!stillPresent) {
-            gInjectAttempts++;
-            id accountObject = ZLModFetchAccountObject(vc);
-            NSUInteger idx = 0;
-            NSMutableArray *container = accountObject ? ZLModFindContainerForObject(vc, accountObject, &idx) : nil;
-            if (container) {
-                if ([container indexOfObjectIdenticalTo:gOurRow] == NSNotFound) {
-                    BOOL inserted = NO;
-                    @try { [container insertObject:gOurRow atIndex:MIN(idx, container.count)]; inserted = YES; } @catch (__unused NSException *e) {}
-                    ZLMOD_LOG(@"ensure: re-inserted row=%d", inserted);
-                    if (inserted) ZLModReloadTable(vc);
-                }
-            } else {
-                ZLMOD_LOG(@"ensure: model gone — clearing row for re-clone");
-                gOurRow = nil; // model gone; re-clone next pass
-            }
-        }
-        ZLModRefreshSnapshot(vc);
-        if (!gOurRow) ZLModInjectRow(vc);
-        return;
-    }
-
-    gInjectAttempts++;
-    BOOL injected = NO;
-    @try { injected = ZLModInjectRow(vc); } @catch (__unused NSException *e) { injected = NO; }
-    if (injected) {
-        // Per-VC retry count (associated object) resets on primary success;
-        // the global attempt counter remains a backstop only and never gates
-        // fallback on its own (see below).
-        objc_setAssociatedObject(vc, &ZLModRetryCountKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        ZLModReloadTable(vc);
+    UIBarButtonItem *btn = nil;
+    UIImage *gear = [UIImage systemImageNamed:@"slider.horizontal.3"];
+    if (gear) {
+        btn = [[UIBarButtonItem alloc] initWithImage:gear
+                                               style:UIBarButtonItemStylePlain
+                                              target:trigger
+                                              action:@selector(openDashboard:)];
     } else {
-        NSNumber *doneNum = objc_getAssociatedObject(vc, &ZLModRetryCountKey);
-        NSInteger tries = doneNum ? doneNum.integerValue : 0;
-        UITableView *tableView = ZLModTableViewForVC(vc);
-        BOOL hasTableView = tableView != nil;
-        BOOL tableReady = ZLModTableReady(vc);
-        ZLMOD_LOG(@"ensure: primary inject failed (attempts=%lu perVCtries=%ld hasTableView=%d tableReady=%d)",
-                 (unsigned long)gInjectAttempts, (long)tries, hasTableView, tableReady);
-        // Deterministic fallback: two primary failures in a row with a
-        // non-nil tableView show the fallback immediately. tableReady alone
-        // never blocks fallback (a buggy ready check is a suspected
-        // blocker) — once per-VC retries are exhausted, fall back anyway.
-        if ((tries >= 1 && hasTableView) || tries >= 2 || gInjectAttempts >= 10) {
-            gFallbackActive = YES;
-            ZLMOD_LOG(@"ensure: primary exhausted after %lu attempts (perVCtries=%ld hasTableView=%d tableReady=%d) — fallback row active",
-                     (unsigned long)gInjectAttempts, (long)tries, hasTableView, tableReady);
-            ZLModReloadTable(vc);
-        } else {
-            ZLModScheduleRetry(vc);
-        }
+        btn = [[UIBarButtonItem alloc] initWithTitle:@"ZLMod"
+                                               style:UIBarButtonItemStylePlain
+                                              target:trigger
+                                              action:@selector(openDashboard:)];
     }
+    btn.tag = kZLModSettingsButtonTag;
+    btn.accessibilityLabel = @"ZLMod Customize";
+    btn.accessibilityIdentifier = @"zlmod.settings.navbutton";
+
+    NSMutableArray<UIBarButtonItem *> *items = navItem.rightBarButtonItems
+        ? [navItem.rightBarButtonItems mutableCopy]
+        : [NSMutableArray array];
+    [items addObject:btn];
+    navItem.rightBarButtonItems = [items copy];
+    state.navFallbackInstalled = YES;
+    ZLMOD_LOG(@"settings: installed safe zero-index-shift navigation bar button");
 }
 
-#pragma mark - Fallback cell
+#pragma mark - Per-VC Injection Lifecycle
 
-static UITableViewCell *ZLModBuildFallbackCell(UITableView *tv, NSIndexPath *indexPath) {
-    NSString *reuse = @"ZLModCustomizeRow";
-    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:reuse];
-    if (cell) return cell;
+static void ZLModEnsureSettingsEntryOnMain(id vc) {
+    if (!vc || ![vc isKindOfClass:[UIViewController class]]) return;
+    ZLModSettingsVCState *state = ZLModStateForSettingsVC(vc);
 
-    for (NSString *name in @[@"BasicSettingCell", @"BasicSettingCellV2"]) {
-        Class cls = NSClassFromString(name);
-        if (!cls || ![cls isSubclassOfClass:[UITableViewCell class]]) continue;
-        @try {
-            cell = [[cls alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuse];
-        } @catch (__unused NSException *e) { cell = nil; }
-        if (cell) break;
-    }
+    // Always attach the zero-index-shift nav button as a guaranteed entry point.
+    ZLModInstallSafeNavBarEntry((UIViewController *)vc, state);
 
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuse];
-        cell.textLabel.font = [UIFont systemFontOfSize:17.0];
-        cell.textLabel.textColor = [UIColor labelColor];
-    }
-    cell.textLabel.text = @"ZLMod Customize";
-    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    return cell;
-}
-
-#pragma mark - Row selection
-
-static BOOL ZLModHandleSelection(id vc, NSIndexPath *indexPath, UITableView *tv) {
-    if (gOurRow) {
-        id tapped = nil;
-        if (gSnapshotAligned && indexPath.section < (NSInteger)gSectionSnapshot.count) {
-            NSArray *section = gSectionSnapshot[(NSUInteger)indexPath.section];
-            if (indexPath.row < (NSInteger)section.count) tapped = section[(NSUInteger)indexPath.row];
-        }
-        if (!tapped) {
-            for (NSArray *section in gSectionSnapshot) {
-                NSUInteger idx = [section indexOfObjectIdenticalTo:gOurRow];
-                if (idx != NSNotFound && (NSInteger)idx == indexPath.row &&
-                    [tv numberOfRowsInSection:indexPath.section] == (NSInteger)section.count) {
-                    tapped = section[idx];
-                    break;
-                }
+    if (state.injectedRow) {
+        BOOL stillPresent = NO;
+        for (NSArray *section in state.sectionSnapshot) {
+            if ([section indexOfObjectIdenticalTo:state.injectedRow] != NSNotFound) {
+                stillPresent = YES;
+                break;
             }
         }
-        if (tapped == gOurRow) {
-            [ZLModSettingsViewController pushFrom:vc];
-            [tv deselectRowAtIndexPath:indexPath animated:YES];
-            return YES;
+        if (stillPresent) return;
+
+        id accountObject = ZLModFetchAccountObject(vc);
+        NSUInteger idx = 0;
+        NSMutableArray *container = ZLModFindContainerForAccountObject(vc, accountObject, &idx);
+        if (container && [container indexOfObjectIdenticalTo:state.injectedRow] == NSNotFound) {
+            @try {
+                [container insertObject:state.injectedRow atIndex:MIN(idx, container.count)];
+                ZLModRefreshSnapshotForVC(vc, state);
+                [ZLModTableViewForVC(vc) reloadData];
+                return;
+            } @catch (__unused NSException *e) {}
         }
-        return NO;
+        state.injectedRow = nil;
     }
 
-    if (gFallbackActive && indexPath.section == 0 && indexPath.row == 0) {
+    if (state.retryCount >= 2) return;
+
+    id accountObject = ZLModFetchAccountObject(vc);
+    NSUInteger accountIdx = 0;
+    NSMutableArray *container = ZLModFindContainerForAccountObject(vc, accountObject, &accountIdx);
+    if (accountObject && container) {
+        id clone = ZLModSafeCloneCellObject(accountObject);
+        NSString *oldTitle = nil;
+        if (clone && ZLModSafeRetitleCellObject(clone, @"ZLMod Customize", &oldTitle)) {
+            @try {
+                [container insertObject:clone atIndex:MIN(accountIdx, container.count)];
+                state.injectedRow = clone;
+                state.retryCount = 0;
+                ZLModRefreshSnapshotForVC(vc, state);
+                [ZLModTableViewForVC(vc) reloadData];
+                ZLMOD_LOG(@"settings: native row injected via safe property clone (replaced=%@)", oldTitle ?: @"?");
+                return;
+            } @catch (__unused NSException *e) {}
+        }
+    }
+
+    state.retryCount++;
+    if (state.retryCount == 1) {
+        __weak id weakVC = vc;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (weakVC) ZLModEnsureSettingsEntryOnMain(weakVC);
+        });
+    }
+}
+
+static BOOL ZLModHandleSettingsSelection(id vc, NSIndexPath *indexPath, UITableView *tv) {
+    ZLModSettingsVCState *state = ZLModStateForSettingsVC(vc);
+    if (!state.injectedRow) return NO;
+
+    id tapped = nil;
+    if (state.snapshotAligned && indexPath.section < (NSInteger)state.sectionSnapshot.count) {
+        NSArray *section = state.sectionSnapshot[(NSUInteger)indexPath.section];
+        if (indexPath.row < (NSInteger)section.count) {
+            tapped = section[(NSUInteger)indexPath.row];
+        }
+    }
+    if (!tapped) {
+        for (NSArray *section in state.sectionSnapshot) {
+            NSUInteger idx = [section indexOfObjectIdenticalTo:state.injectedRow];
+            if (idx != NSNotFound &&
+                (NSInteger)idx == indexPath.row &&
+                [tv numberOfRowsInSection:indexPath.section] == (NSInteger)section.count) {
+                tapped = section[idx];
+                break;
+            }
+        }
+    }
+    if (tapped == state.injectedRow) {
         [ZLModSettingsViewController pushFrom:vc];
         [tv deselectRowAtIndexPath:indexPath animated:YES];
         return YES;
@@ -612,21 +556,27 @@ static BOOL ZLModHandleSelection(id vc, NSIndexPath *indexPath, UITableView *tv)
     return NO;
 }
 
-#pragma mark - Install
+#pragma mark - Universal Shake Presenter & Install
 
 typedef void (*ZLModV0)(id, SEL);
 typedef void (*ZLModV1Bool)(id, SEL, BOOL);
 typedef void (*ZLModV2)(id, SEL, id, id);
-typedef NSInteger (*ZLModQ2)(id, SEL, id, NSInteger);
-typedef id (*ZLModObj2)(id, SEL, id, id);
 
 void ZLModPresentSettingsUniversal(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    ZLModRunOnMainThread(^{
+        if ([[ZLModPreferences shared] boolForKey:kZLModDisableShakeToOpen]) {
+            return;
+        }
+        // Respect iOS standard "Shake to Undo Typing" when user is editing text.
+        if (ZLModIsAnyTextInputActive()) {
+            ZLMOD_LOG(@"settings: shake ignored because a text input is active (Undo Typing safe)");
+            return;
+        }
         UIWindow *win = ZLModActiveKeyWindow();
         if (!win) return;
         UIViewController *top = win.rootViewController;
         if (!top) return;
-        while (top.presentedViewController) {
+        while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) {
             top = top.presentedViewController;
         }
         if ([top isKindOfClass:[ZLModSettingsViewController class]] ||
@@ -639,21 +589,21 @@ void ZLModPresentSettingsUniversal(void) {
 }
 
 void ZLModSettingsInstall(void) {
-    // 1. Universal Shake Gesture: Shake device anywhere to present ZLMod Customize menu directly
+    // 1. Universal Shake Gesture (opt-out via kZLModDisableShakeToOpen; Undo-Typing safe)
     Class winCls = [UIWindow class];
     SEL motionSel = sel_registerName("motionEnded:withEvent:");
+    BOOL okShake = NO;
     if (ZLModClassHasInstanceMethod(winCls, motionSel)) {
         IMP motionOrig = class_getMethodImplementation(winCls, motionSel);
-        ZLModReplaceMethod(winCls, motionSel, 2, "v", ^(UIWindow *self, UIEventSubtype motion, UIEvent *event) {
-            ((void (*)(id, SEL, UIEventSubtype, id))motionOrig)(self, motionSel, motion, event);
+        okShake = ZLModReplaceMethod(winCls, motionSel, 2, "v", ^(UIWindow *self, UIEventSubtype motion, UIEvent *event) {
+            if (motionOrig) ((void (*)(id, SEL, UIEventSubtype, id))motionOrig)(self, motionSel, motion, event);
             if (motion == UIEventSubtypeMotionShake) {
-                ZLMOD_LOG(@"shake gesture detected — presenting ZLMod Customize");
                 ZLModPresentSettingsUniversal();
             }
         });
     }
 
-    // 2. Discover Settings Hub Class with multi-version fallback
+    // 2. Discover Settings Hub Class
     NSArray<NSString *> *candidates = @[
         @"SettingUI40TableViewController",
         @"SettingUITableViewController",
@@ -665,125 +615,74 @@ void ZLModSettingsInstall(void) {
         Class c = NSClassFromString(name);
         if (c) {
             gSettingsClass = c;
-            ZLMOD_LOG(@"settings hub class candidate '%@' matched", name);
             break;
         }
     }
 
-    BOOL settingsClassFound = gSettingsClass != Nil;
-    ZLMOD_LOG(@"settings hub class found=%d (%@)",
-             settingsClassFound, gSettingsClass ? NSStringFromClass(gSettingsClass) : @"<nil>");
     if (!gSettingsClass) {
         ZLModSetModuleStatus(@"Settings", ZLModModuleStatusNotInstalled,
-                             @"Settings table view not found — universal shake gesture active");
-        ZLMOD_LOG(@"settings table class not found — relying on universal shake gesture");
+                             okShake ? @"settings VC not found; shake active" : @"settings VC not found");
+        ZLMOD_LOG(@"settings table class not found — relying on shake gesture (ok=%d)", okShake);
         return;
     }
 
     SEL viewDidLoadSel = sel_registerName("viewDidLoad");
     IMP viewDidLoadOrig = class_getMethodImplementation(gSettingsClass, viewDidLoadSel);
     BOOL okViewDidLoad = ZLModReplaceMethod(gSettingsClass, viewDidLoadSel, 0, "v", ^(id self) {
-        ((ZLModV0)viewDidLoadOrig)(self, viewDidLoadSel);
-        dispatch_async(dispatch_get_main_queue(), ^{ ZLModEnsureRow(self); });
+        if (viewDidLoadOrig) ((ZLModV0)viewDidLoadOrig)(self, viewDidLoadSel);
+        ZLModRunOnMainThread(^{ ZLModEnsureSettingsEntryOnMain(self); });
     });
-    ZLMOD_LOG(@"settings hook viewDidLoad validated=%d", okViewDidLoad);
 
     SEL willAppearSel = sel_registerName("viewWillAppear:");
     IMP willAppearOrig = class_getMethodImplementation(gSettingsClass, willAppearSel);
     BOOL okViewWillAppear = ZLModReplaceMethod(gSettingsClass, willAppearSel, 1, "v", ^(id self, BOOL animated) {
-        ((ZLModV1Bool)willAppearOrig)(self, willAppearSel, animated);
-        ZLModEnsureRow(self);
+        if (willAppearOrig) ((ZLModV1Bool)willAppearOrig)(self, willAppearSel, animated);
+        ZLModEnsureSettingsEntryOnMain(self);
     });
-    ZLMOD_LOG(@"settings hook viewWillAppear: validated=%d", okViewWillAppear);
-
-    SEL didAppearSel = sel_registerName("viewDidAppear:");
-    IMP didAppearOrig = class_getMethodImplementation(gSettingsClass, didAppearSel);
-    BOOL okViewDidAppear = ZLModReplaceMethod(gSettingsClass, didAppearSel, 1, "v", ^(id self, BOOL animated) {
-        ((ZLModV1Bool)didAppearOrig)(self, didAppearSel, animated);
-        dispatch_async(dispatch_get_main_queue(), ^{ ZLModEnsureRow(self); });
-    });
-    ZLMOD_LOG(@"settings hook viewDidAppear: validated=%d", okViewDidAppear);
 
     SEL updateTitleSel = sel_registerName("updateTitleObjects");
     BOOL okUpdateTitle = NO;
     if (ZLModClassHasInstanceMethod(gSettingsClass, updateTitleSel)) {
         IMP updateTitleOrig = class_getMethodImplementation(gSettingsClass, updateTitleSel);
         okUpdateTitle = ZLModReplaceMethod(gSettingsClass, updateTitleSel, 0, "v", ^(id self) {
-            ((ZLModV0)updateTitleOrig)(self, updateTitleSel);
-            dispatch_async(dispatch_get_main_queue(), ^{ ZLModEnsureRow(self); });
+            if (updateTitleOrig) ((ZLModV0)updateTitleOrig)(self, updateTitleSel);
+            ZLModRunOnMainThread(^{ ZLModEnsureSettingsEntryOnMain(self); });
         });
     }
-    ZLMOD_LOG(@"settings hook updateTitleObjects validated=%d", okUpdateTitle);
 
     SEL didSelectSel = sel_registerName("tableView:didSelectRowAtIndexPath:");
     IMP didSelectOrig = class_getMethodImplementation(gSettingsClass, didSelectSel);
     BOOL okDidSelect = ZLModReplaceMethod(gSettingsClass, didSelectSel, 2, "v", ^(id self, UITableView *tv, NSIndexPath *indexPath) {
-        if (ZLModHandleSelection(self, indexPath, tv)) return;
-        NSIndexPath *forward = indexPath;
-        if (gFallbackActive && !gOurRow && indexPath.section == 0 && indexPath.row > 0) {
-            forward = [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section];
-        }
-        ((ZLModV2)didSelectOrig)(self, didSelectSel, tv, forward);
+        if (ZLModHandleSettingsSelection(self, indexPath, tv)) return;
+        if (didSelectOrig) ((ZLModV2)didSelectOrig)(self, didSelectSel, tv, indexPath);
     });
-    ZLMOD_LOG(@"settings hook didSelect validated=%d (tableView:didSelectRowAtIndexPath:)", okDidSelect);
 
-    SEL rowsSel = sel_registerName("tableView:numberOfRowsInSection:");
-    BOOL okNumberOfRows = NO;
-    if (ZLModClassHasInstanceMethod(gSettingsClass, rowsSel)) {
-        IMP rowsOrig = class_getMethodImplementation(gSettingsClass, rowsSel);
-        okNumberOfRows = ZLModReplaceMethod(gSettingsClass, rowsSel, 2, "q", ^NSInteger(id self, UITableView *tv, NSInteger section) {
-            NSInteger rows = ((ZLModQ2)rowsOrig)(self, rowsSel, tv, section);
-            if (gFallbackActive && !gOurRow && section == 0) rows += 1;
-            return rows;
-        });
-    }
-    ZLMOD_LOG(@"settings hook numberOfRows validated=%d (tableView:numberOfRowsInSection:)", okNumberOfRows);
-
-    SEL cellSel = sel_registerName("tableView:cellForRowAtIndexPath:");
-    BOOL okCellForRow = NO;
-    if (ZLModClassHasInstanceMethod(gSettingsClass, cellSel)) {
-        IMP cellOrig = class_getMethodImplementation(gSettingsClass, cellSel);
-        okCellForRow = ZLModReplaceMethod(gSettingsClass, cellSel, 2, "@", ^id(id self, UITableView *tv, NSIndexPath *indexPath) {
-            if (gFallbackActive && !gOurRow && indexPath.section == 0) {
-                if (indexPath.row == 0) return ZLModBuildFallbackCell(tv, indexPath);
-                NSIndexPath *forward = [NSIndexPath indexPathForRow:indexPath.row - 1 inSection:indexPath.section];
-                return ((ZLModObj2)cellOrig)(self, cellSel, tv, forward);
-            }
-            return ((ZLModObj2)cellOrig)(self, cellSel, tv, indexPath);
-        });
-    }
-    ZLMOD_LOG(@"settings hook cellForRow validated=%d (tableView:cellForRowAtIndexPath:)", okCellForRow);
-    ZLMOD_LOG(@"settings hooks summary viewDidAppear:=%d viewWillAppear:=%d updateTitleObjects=%d cellForRow=%d numberOfRows=%d didSelect=%d",
-             okViewDidAppear, okViewWillAppear, okUpdateTitle, okCellForRow, okNumberOfRows, okDidSelect);
-
-    // Late install: Settings may already be on screen before hooks land.
-    // Scan the key window once (main queue) so the visible instance still
-    // gets an injection attempt — no polling loop.
-    dispatch_async(dispatch_get_main_queue(), ^{
+    // Late install check if Settings is already visible on screen.
+    ZLModRunOnMainThread(^{
         UIWindow *window = ZLModActiveKeyWindow();
         UIViewController *root = window.rootViewController;
-        if (!root || window == nil) return;
+        if (!root) return;
         NSMutableArray<UIViewController *> *stack = [NSMutableArray arrayWithObject:root];
-        id found = nil;
-        while (stack.count > 0 && !found) {
+        while (stack.count > 0) {
             UIViewController *cursor = stack.firstObject;
             [stack removeObjectAtIndex:0];
-            if (object_getClass(cursor) == gSettingsClass) { found = cursor; break; }
+            if (object_getClass(cursor) == gSettingsClass) {
+                @try { ZLModEnsureSettingsEntryOnMain(cursor); } @catch (__unused NSException *e) {}
+                break;
+            }
             [stack addObjectsFromArray:cursor.childViewControllers];
             if (cursor.presentedViewController) [stack addObject:cursor.presentedViewController];
             if ([cursor isKindOfClass:[UINavigationController class]]) {
                 [stack addObjectsFromArray:[(UINavigationController *)cursor viewControllers]];
             }
         }
-        if (found) {
-            ZLMOD_LOG(@"ensure: late install found visible settings screen — injecting");
-            @try { ZLModEnsureRow(found); } @catch (__unused NSException *e) {}
-        }
     });
 
+    BOOL installed = (okViewDidLoad || okViewWillAppear || okDidSelect);
     ZLModSetModuleStatus(@"Settings",
-                         okDidSelect ? ZLModModuleStatusHookInstalled : ZLModModuleStatusNotInstalled,
-                         [NSString stringWithFormat:@"didAppear=%d willAppear=%d didSelect=%d",
-                          okViewDidAppear, okViewWillAppear, okDidSelect]);
-    ZLMOD_LOG(@"settings integration installed");
+                         installed ? ZLModModuleStatusHookInstalled : ZLModModuleStatusNotInstalled,
+                         [NSString stringWithFormat:@"cls=%@ load=%d appear=%d select=%d update=%d shake=%d",
+                          NSStringFromClass(gSettingsClass), okViewDidLoad, okViewWillAppear,
+                          okDidSelect, okUpdateTitle, okShake]);
+    ZLMOD_LOG(@"settings integration installed (%@)", NSStringFromClass(gSettingsClass));
 }

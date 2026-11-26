@@ -1,10 +1,12 @@
 // language: Objective-C, file: ZLModPrivacy.m, target: iOS 15.1+ (Zalo 26.10.02 & 26.11.01, arm64)
-// Messaging privacy & analytics control with ABI-verified hooks and
-// per-conversation selective enforcement scoped to the active account.
-// Local read state on device is left untouched; only outbound server reports
-// (seen, read-receipt ACKs, typing indicators) are suppressed when enabled.
+// Messaging privacy & analytics control with ABI-verified hooks, single-pass selector index,
+// unified ZLModChatEntityAdapter resolution, per-conversation selective enforcement,
+// and reversible Firebase telemetry toggle (ON disables, OFF restores).
 
 #import "ZLMod.h"
+
+static BOOL gPrivacyObserversInstalled = NO;
+static BOOL gFirebaseDisabledByZLMod = NO;
 
 #pragma mark - Helper resolvers (never log raw user/thread IDs)
 
@@ -16,7 +18,7 @@ static NSString *ZLModExtractThreadIdFromObject(id obj) {
     }
     if ([obj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)obj;
-        for (NSString *k in @[@"threadId", @"threadid", @"tuid", @"toUid", @"userid", @"userId", @"uid"]) {
+        for (NSString *k in @[@"threadId", @"threadid", @"tuid", @"userid", @"userId", @"uid", @"groupId"]) {
             id val = dict[k];
             if ([val isKindOfClass:[NSString class]] && [(NSString *)val length] > 0) {
                 return (NSString *)val;
@@ -29,27 +31,18 @@ static NSString *ZLModExtractThreadIdFromObject(id obj) {
         return nil;
     }
 
-    for (NSString *selName in @[@"rt_threadId", @"threadId", @"threadid", @"tuid", @"userId", @"userid", @"getGroupId", @"swipeKey"]) {
+    NSString *adapted = [ZLModChatEntityAdapter extractThreadIdFromObject:obj];
+    if (adapted.length > 0) return adapted;
+
+    for (NSString *selName in @[@"rt_threadId", @"threadid", @"userid", @"getGroupId", @"swipeKey"]) {
         NSString *val = ZLModSafeStringProperty(obj, NSSelectorFromString(selName));
         if (val.length > 0 && ![val isEqualToString:@"0"]) return val;
-    }
-
-    id convModel = ZLModSafeObjectProperty(obj, sel_registerName("conversationModel"));
-    if (convModel) {
-        NSString *tid = ZLModSafeStringProperty(convModel, sel_registerName("threadId"));
-        if (tid.length > 0) return tid;
     }
     return nil;
 }
 
 static NSString *ZLModExtractConvTypeFromObject(id obj, NSString *threadIdHint) {
     if (obj) {
-        if (ZLModClassHasInstanceMethod(object_getClass(obj), sel_registerName("isChatGroup"))) {
-            if (ZLModSafeBoolProperty(obj, sel_registerName("isChatGroup"), NO)) return @"group";
-        }
-        if (ZLModClassHasInstanceMethod(object_getClass(obj), sel_registerName("isGroup"))) {
-            if (ZLModSafeBoolProperty(obj, sel_registerName("isGroup"), NO)) return @"group";
-        }
         if ([obj isKindOfClass:[NSDictionary class]]) {
             NSDictionary *dict = (NSDictionary *)obj;
             if ([dict[@"isGroup"] respondsToSelector:@selector(boolValue)] && [dict[@"isGroup"] boolValue]) {
@@ -59,6 +52,9 @@ static NSString *ZLModExtractConvTypeFromObject(id obj, NSString *threadIdHint) 
             if ([mType respondsToSelector:@selector(integerValue)] && [mType integerValue] == 2) {
                 return @"group";
             }
+        } else {
+            NSString *adapted = [ZLModChatEntityAdapter extractConversationTypeFromObject:obj];
+            if ([adapted isEqualToString:@"group"]) return @"group";
         }
     }
     NSString *activeTid = [ZLModPrivacyContext activeThreadId];
@@ -132,51 +128,42 @@ static NSUInteger ZLModInstallChatContextHooks(void) {
 }
 
 static NSUInteger ZLModInstallSeenHooks(void) {
-    __block NSUInteger installed = 0;
+    NSUInteger installed = 0;
 
-    // 1. Outgoing seen per chat entity or talk item (UI & chat controller layer)
+    // 1. Outgoing seen per chat entity / talk item / batch (single-pass prewarmed index)
     SEL seenEntitySel = sel_registerName("sendSeenMessageWithChatEntity:");
-    ZLModEnumerateAppClasses(^(Class cls) {
-        if (!ZLModClassHasInstanceMethod(cls, seenEntitySel)) return;
+    for (Class cls in ZLModClassesImplementingInstanceSelector(seenEntitySel)) {
         IMP orig = class_getMethodImplementation(cls, seenEntitySel);
         if (ZLModReplaceMethod(cls, seenEntitySel, 1, "v", ^(id selfObj, id chatEntity) {
-            if (ZLModShouldHideSeenForContext(chatEntity ?: selfObj, nil, NO)) {
-                return;
-            }
+            if (ZLModShouldHideSeenForContext(chatEntity ?: selfObj, nil, NO)) return;
             if (orig) ((void (*)(id, SEL, id))orig)(selfObj, seenEntitySel, chatEntity);
         })) {
             installed++;
         }
-    });
+    }
 
     SEL seenTalkSel = sel_registerName("sendSeenMessageWithTalkTableItem:");
-    ZLModEnumerateAppClasses(^(Class cls) {
-        if (!ZLModClassHasInstanceMethod(cls, seenTalkSel)) return;
+    for (Class cls in ZLModClassesImplementingInstanceSelector(seenTalkSel)) {
         IMP orig = class_getMethodImplementation(cls, seenTalkSel);
         if (ZLModReplaceMethod(cls, seenTalkSel, 1, "v", ^(id selfObj, id talkItem) {
-            if (ZLModShouldHideSeenForContext(talkItem ?: selfObj, nil, NO)) {
-                return;
-            }
+            if (ZLModShouldHideSeenForContext(talkItem ?: selfObj, nil, NO)) return;
             if (orig) ((void (*)(id, SEL, id))orig)(selfObj, seenTalkSel, talkItem);
         })) {
             installed++;
         }
-    });
+    }
 
     SEL seenBatchSel = sel_registerName("sendSeenMessages:messageDict:incomingData:");
-    ZLModEnumerateAppClasses(^(Class cls) {
-        if (!ZLModClassHasInstanceMethod(cls, seenBatchSel)) return;
+    for (Class cls in ZLModClassesImplementingInstanceSelector(seenBatchSel)) {
         IMP orig = class_getMethodImplementation(cls, seenBatchSel);
         if (ZLModReplaceMethod(cls, seenBatchSel, 3, "v", ^(id selfObj, id msgs, id msgDict, id incomingData) {
             id hintObj = incomingData ?: ([msgs isKindOfClass:[NSArray class]] ? [(NSArray *)msgs firstObject] : msgs);
-            if (ZLModShouldHideSeenForContext(hintObj ?: selfObj, nil, NO)) {
-                return;
-            }
+            if (ZLModShouldHideSeenForContext(hintObj ?: selfObj, nil, NO)) return;
             if (orig) ((void (*)(id, SEL, id, id, id))orig)(selfObj, seenBatchSel, msgs, msgDict, incomingData);
         })) {
             installed++;
         }
-    });
+    }
 
     // 2. ChatSendSeenDataManager (only void action methods; never hook queue property getters)
     Class seenMgrCls = NSClassFromString(@"ChatSendSeenDataManager");
@@ -186,9 +173,7 @@ static NSUInteger ZLModInstallSeenHooks(void) {
             IMP orig = class_getMethodImplementation(seenMgrCls, sendDataSel);
             if (ZLModReplaceMethod(seenMgrCls, sendDataSel, 2, "v", ^(id selfObj, id seenData, NSUInteger msgType) {
                 NSString *ctype = (msgType == 2) ? @"group" : @"single";
-                if (ZLModShouldHideSeenForContext(seenData, ctype, YES)) {
-                    return;
-                }
+                if (ZLModShouldHideSeenForContext(seenData, ctype, YES)) return;
                 if (orig) ((void (*)(id, SEL, id, NSUInteger))orig)(selfObj, sendDataSel, seenData, msgType);
             })) {
                 installed++;
@@ -336,9 +321,9 @@ static NSUInteger ZLModInstallTypingHooks(void) {
             IMP orig = class_getMethodImplementation(object_getClass(sockCls), socketTypingSel);
             if (ZLModReplaceClassMethod(sockCls, socketTypingSel, 5, "Q",
                                         ^NSUInteger(id clsSelf, NSUInteger typingType, NSInteger cmd, NSUInteger subCmd, NSInteger destType, int64_t globalMsgId) {
+                NSString *destConvType = (destType == 1 || destType == 2) ? @"group" : [ZLModPrivacyContext activeConversationType];
                 NSString *activeTid = [ZLModPrivacyContext activeThreadId];
-                NSString *activeType = [ZLModPrivacyContext activeConversationType];
-                if (ZLModShouldHideTypingForThread(activeTid, activeType)) {
+                if (ZLModShouldHideTypingForThread(activeTid, destConvType)) {
                     return 0;
                 }
                 return orig ? ((NSUInteger (*)(id, SEL, NSUInteger, NSInteger, NSUInteger, NSInteger, int64_t))orig)(clsSelf, socketTypingSel, typingType, cmd, subCmd, destType, globalMsgId) : 0;
@@ -351,40 +336,55 @@ static NSUInteger ZLModInstallTypingHooks(void) {
     return installed;
 }
 
-#pragma mark - Firebase / analytics
+#pragma mark - Reversible Firebase / analytics toggle
 
 static void ZLModApplyFirebaseState(void) {
     BOOL blocked = [[ZLModPreferences shared] boolForKey:kZLModBlockFirebase];
-    if (!blocked) return;
-
-    Class firAnalytics = NSClassFromString(@"FIRAnalytics");
-    if (firAnalytics && [firAnalytics respondsToSelector:NSSelectorFromString(@"setAnalyticsCollectionEnabled:")]) {
-        IMP imp = class_getMethodImplementation(object_getClass(firAnalytics),
-                                                NSSelectorFromString(@"setAnalyticsCollectionEnabled:"));
-        if (imp) ((void (*)(id, SEL, BOOL))imp)(firAnalytics,
-                                               NSSelectorFromString(@"setAnalyticsCollectionEnabled:"), NO);
+    if (!blocked && !gFirebaseDisabledByZLMod) {
+        // Default OFF at boot: never touch host Firebase collection state unless user toggled it.
+        return;
     }
 
-    Class firPerformance = NSClassFromString(@"FIRPerformance");
-    if (firPerformance && [firPerformance respondsToSelector:NSSelectorFromString(@"setDataCollectionEnabled:")]) {
-        IMP imp = class_getMethodImplementation(object_getClass(firPerformance),
-                                                NSSelectorFromString(@"setDataCollectionEnabled:"));
-        if (imp) ((void (*)(id, SEL, BOOL))imp)(firPerformance,
-                                               NSSelectorFromString(@"setDataCollectionEnabled:"), NO);
-    }
-
-    Class crashlytics = NSClassFromString(@"FIRCrashlytics");
-    SEL sharedSel = NSSelectorFromString(@"crashlytics");
-    if (crashlytics && [crashlytics respondsToSelector:sharedSel]) {
-        IMP sharedImp = class_getMethodImplementation(object_getClass(crashlytics), sharedSel);
-        id instance = sharedImp ? ((id (*)(id, SEL))sharedImp)(crashlytics, sharedSel) : nil;
-        SEL collectionSel = NSSelectorFromString(@"setCrashlyticsCollectionEnabled:");
-        if (instance && [instance respondsToSelector:collectionSel]) {
-            IMP imp = class_getMethodImplementation(object_getClass(instance), collectionSel);
-            if (imp) ((void (*)(id, SEL, BOOL))imp)(instance, collectionSel, NO);
+    BOOL enabled = !blocked;
+    @try {
+        Class firAnalytics = NSClassFromString(@"FIRAnalytics");
+        SEL analyticsSel = sel_registerName("setAnalyticsCollectionEnabled:");
+        if (firAnalytics && [firAnalytics respondsToSelector:analyticsSel]) {
+            IMP imp = class_getMethodImplementation(object_getClass(firAnalytics), analyticsSel);
+            if (imp) ((void (*)(id, SEL, BOOL))imp)(firAnalytics, analyticsSel, enabled);
         }
+
+        Class firPerformance = NSClassFromString(@"FIRPerformance");
+        SEL perfClassSel = sel_registerName("setDataCollectionEnabled:");
+        if (firPerformance && [firPerformance respondsToSelector:perfClassSel]) {
+            IMP imp = class_getMethodImplementation(object_getClass(firPerformance), perfClassSel);
+            if (imp) ((void (*)(id, SEL, BOOL))imp)(firPerformance, perfClassSel, enabled);
+        } else if (firPerformance && [firPerformance respondsToSelector:sel_registerName("sharedInstance")]) {
+            IMP sharedImp = class_getMethodImplementation(object_getClass(firPerformance), sel_registerName("sharedInstance"));
+            id perfInst = sharedImp ? ((id (*)(id, SEL))sharedImp)(firPerformance, sel_registerName("sharedInstance")) : nil;
+            if (perfInst && [perfInst respondsToSelector:perfClassSel]) {
+                IMP imp = class_getMethodImplementation(object_getClass(perfInst), perfClassSel);
+                if (imp) ((void (*)(id, SEL, BOOL))imp)(perfInst, perfClassSel, enabled);
+            }
+        }
+
+        Class crashlytics = NSClassFromString(@"FIRCrashlytics");
+        SEL sharedSel = sel_registerName("crashlytics");
+        if (crashlytics && [crashlytics respondsToSelector:sharedSel]) {
+            IMP sharedImp = class_getMethodImplementation(object_getClass(crashlytics), sharedSel);
+            id instance = sharedImp ? ((id (*)(id, SEL))sharedImp)(crashlytics, sharedSel) : nil;
+            SEL collectionSel = sel_registerName("setCrashlyticsCollectionEnabled:");
+            if (instance && [instance respondsToSelector:collectionSel]) {
+                IMP imp = class_getMethodImplementation(object_getClass(instance), collectionSel);
+                if (imp) ((void (*)(id, SEL, BOOL))imp)(instance, collectionSel, enabled);
+            }
+        }
+    } @catch (NSException *e) {
+        ZLMOD_LOG(@"Firebase toggle failed: %@", e.reason ?: @"unknown");
     }
-    ZLMOD_LOG(@"Firebase collection disabled");
+
+    gFirebaseDisabledByZLMod = blocked;
+    ZLMOD_LOG(@"Firebase collection %@", blocked ? @"disabled" : @"restored (enabled)");
 }
 
 #pragma mark - Install
@@ -395,14 +395,18 @@ void ZLModPrivacyInstall(void) {
     NSUInteger typingCount = ZLModInstallTypingHooks();
 
     ZLModApplyFirebaseState();
-    [[NSNotificationCenter defaultCenter] addObserverForName:ZLModPrefsDidChangeNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(NSNotification *note) {
-        if ([note.object isEqualToString:kZLModBlockFirebase]) {
-            ZLModApplyFirebaseState();
-        }
-    }];
+    if (!gPrivacyObserversInstalled) {
+        gPrivacyObserversInstalled = YES;
+        [[NSNotificationCenter defaultCenter] addObserverForName:ZLModPrefsDidChangeNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+            NSString *key = [note.object isKindOfClass:[NSString class]] ? (NSString *)note.object : @"";
+            if ([key isEqualToString:kZLModBlockFirebase] || [key isEqualToString:@"*"]) {
+                ZLModApplyFirebaseState();
+            }
+        }];
+    }
 
     ZLModSetModuleStatus(@"SeenPrivacy",
                          seenCount > 0 ? ZLModModuleStatusHookInstalled : ZLModModuleStatusNotInstalled,

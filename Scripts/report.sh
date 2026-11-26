@@ -4,7 +4,8 @@ set -euo pipefail
 
 DYLIB="${1:-build/libZLMod.dylib}"
 OUTDIR="${2:-build}"
-VERSION="${ZLMOD_VERSION:-build-5}"
+DEFAULT_VERSION=$(python3 -c 'import json; print(json.load(open("Resources/version.json"))["tag"])' 2>/dev/null || echo "build-11")
+VERSION="${ZLMOD_VERSION:-$DEFAULT_VERSION}"
 TAG="${GITHUB_REF_NAME:-local}"
 COMMIT="${GITHUB_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo local)}"
 
@@ -32,24 +33,27 @@ cat > "$OUTDIR/IMPLEMENTATION-REPORT.md" <<EOF
 
 | Module | Deliverable |
 |---|---|
-| ZLModCore | constructor boot, module isolation, redacted ring-buffer + file logging, session observers |
-| ZLModCompatibility | host identity + exact version/build gate + anchor checks |
-| ZLModPreferences | persistent toggles, numeric/string settings, external App Group mirror + reset |
-| ZLModHookEngine | runtime discovery, ABI-validated instance/class method replacement, safe property readers |
-| ZLModCryptoStore | Keychain-backed AES-256-CBC + HMAC-SHA256 v2 storage box + accountScope resolver |
-| ZLModPolicyStore | active chat context tracker + account-scoped per-conversation policies |
-| ZLModURIFilter | in-process tracking/ad endpoint blocking (NSURLProtocol) |
-| ZLModPrivacy | Mach-O verified Seen & Typing hooks (global + per-conversation) + Firebase off |
-| ZLModConversationMenu | InboxContextMenuManager long-press menu + UXInboxMessageCell / ChatListItemCell blue dot |
-| ZLModAntiRecall | local encrypted Ghost Preview (14-day TTL, explicit local-copy label, non-mutating) |
-| ZLModUtilities | encrypted Private Notes, Quick Reply templates (composer insert only), Delay Send Undo FSM |
-| ZLModTheme | optional theme presets + custom tint hex with baseline window/bar restoration |
-| ZLModAds | ad request blocking + ad view neutralization |
-| ZLModFeatures | Profile Music restore, Google Drive backup bridge, More tab key |
-| ZLModSettings | ZLMod Customize row (cloned native cell) + navigation |
-| ZLModUI | full settings dashboard + 6 child management/diagnostic controllers |
-| ZLModGlass | tab bar glass material overlay (REAL_GLASS / BLUR tier) |
-| ZLModBridge | native WebSocket pairing (CPairing), message relay & storage buffer (CSaving), two-way settings sync with user confirmation (CDeploy), Discord webhook alerts |
+| ZLModCore | two-phase constructor boot (background hooks + main-thread UI), module isolation, redacted ring-buffer + async file logging, session observers |
+| ZLModCompatibility | single-truth host identity + exact version/build gate + verified 3-class runtime anchor quorum |
+| ZLModPreferences | persistent toggles, Keychain-backed secrets (ZLModSecretStore), batch updates, strict CDeploy allowlist |
+| ZLModHookEngine | single-pass selector index, ABI-validated instance/class method replacement, main-thread safe UIKit helpers |
+| ZLModChatEntityAdapter | immutable ZLModMessageModel normalization (ms/s timestamps, exact recall placeholder matching, photo extraction) |
+| ZLModCryptoStore | Keychain-backed AES-256-CBC + HMAC-SHA256 v2 binary/text storage box, ZLModSecretStore, storage health state, async disk I/O |
+| ZLModOverlayUI | decoupled main-thread helpers + queued VoiceOver/Dynamic-Type toast banner |
+| ZLModPolicyStore | LIFO active chat context stack + account-scoped per-conversation policies with encrypted conversation titles |
+| ZLModURIFilter | in-process tracking/ad endpoint blocking covering NSURLSession default/ephemeral configs + Bridge/Discord/WS exemptions |
+| ZLModPrivacy | Mach-O verified Seen & Typing hooks (global + per-conversation) + reversible Firebase opt-out |
+| ZLModConversationMenu | InboxContextMenuManager & InboxContextMenuProvider long-press menu + UXInboxMessageCell / ChatListItemCell blue dot |
+| ZLModMessageTap | decoupled ZLModMessageTapBus routing normalized message/recall events to AntiRecall, CSaving, and DiscordRelay |
+| ZLModAntiRecall | local encrypted Ghost Preview (text + encrypted disk photos, 20MB quota, 14-day TTL, non-mutating, cell reuse cleanup) |
+| ZLModUtilities | multi-line encrypted Private Notes, account-scoped Quick Reply picker, multi-item keyboard-aware Delay Send Undo FSM |
+| ZLModTheme | unified ZLModAppearanceCoordinator + optional theme presets & strict #RRGGBB tint with baseline restoration |
+| ZLModAds | ad request blocking + reversible live ad view neutralization |
+| ZLModFeatures | Profile Music restore, Google Drive backup bridge, More tab key (single-pass selector index) |
+| ZLModSettings | per-VC isolated ZLMod Customize entry + guaranteed zero-index-shift nav bar fallback + undo-safe Shake Gesture |
+| ZLModUI | full settings dashboard + 7 child management/diagnostic screens with storage health banners & pull-to-refresh |
+| ZLModGlass | system ultra-thin blur tab bar material coordinated via ZLModAppearanceCoordinator |
+| ZLModBridge | 4-state WebSocket FSM with epoch guard, backoff & pong timeout, Bonjour LAN discovery, decoupled CSaving, allowlisted CDeploy, automatic Discord Webhook relay |
 
 ## Exported interface
 
@@ -62,18 +66,18 @@ cat > "$OUTDIR/COMPATIBILITY-REPORT.md" <<EOF
 # ZLMod — Compatibility Report
 
 - Host: Zalo 26.10.02 (261002802) & 26.11.01 (261101802), vn.com.vng.zingalo / vn.com.vng.zingalo2, arm64
+- Fallback compatibility: verified 3-class runtime anchor quorum (ZaloTabBarViewController + ChatDataManager + SettingUI40TableViewController/BasicSettingTableViewController); loose bundle substring checks removed.
 - Deployment target: iOS 15.1 (host MinimumOSVersion)
 - Runtime guards: every host class/selector is resolved via NSClassFromString /
   sel_registerName and validated (arity + return encoding) before use; missing
   anchors degrade to a logged no-op — no crash path.
-- Multi-account & encryption: per-conversation policies, Private Notes, and
-  Anti-Recall records are scoped by verified accountScope (SHA-256 prefix of the
-  active Zalo userId) and encrypted with AES-256-CBC + HMAC-SHA256 using a
-  device-only iOS Keychain master key; unidentified state fails closed.
-- Liquid Glass: UIGlassEffect used only when present at runtime (iOS 26+);
-  otherwise system blur material. The host opts out of the iOS 26 redesign
-  (UIDesignRequiresCompatibility=YES), so system glass adoption would require
-  repackaging — documented in docs/ARCHITECTURE.md.
+- Multi-account & encryption: per-conversation policies, Private Notes,
+  Anti-Recall records/photos, and Quick Replies are scoped by verified accountScope
+  (SHA-256 prefix of the active Zalo userId). Sensitive secrets (Bridge Token,
+  Discord Webhook) are stored exclusively in iOS Keychain (ZLModSecretStore).
+- Tab Bar Material: Zalo opts out of the iOS 26 redesign
+  (UIDesignRequiresCompatibility=YES), so ZLMod applies UIBlurEffectStyleSystemUltraThinMaterial
+  via ZLModAppearanceCoordinator without referencing UIGlassEffect.
 - Not ported by design (no usable iOS mechanism / server-authoritative / unsafe):
   Original Photo Default, ZCloud premium unlock, video transcode bypass,
   server TTL/upload limit override, group admin/owner spoofing, chat-head overlay.

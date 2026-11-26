@@ -134,9 +134,12 @@ def macho_info(stream) -> dict[str, object] | None:
         "cryptsize": None,
         "load_dylibs": [],
         "rpaths": [],
+        "alignment_errors": [],
     }
+    if is64 and (sizeofcmds % 8 != 0):
+        info["alignment_errors"].append(f"sizeofcmds={sizeofcmds} is not 8-byte aligned")
     cursor = 0
-    for _ in range(ncmds):
+    for idx in range(ncmds):
         if cursor + 8 > len(cmds):
             info["parse_warning"] = "load_commands_truncated"
             break
@@ -144,6 +147,8 @@ def macho_info(stream) -> dict[str, object] | None:
         if size < 8 or cursor + size > len(cmds):
             info["parse_warning"] = "invalid_load_command_size"
             break
+        if is64 and (size % 8 != 0):
+            info["alignment_errors"].append(f"cmd[{idx}] ({hex(cmd)}) cmdsize={size} is not 8-byte aligned")
         block = cmds[cursor : cursor + size]
         base_cmd = cmd & 0x7FFFFFFF
         if base_cmd in (0x21, 0x2C) and size >= (24 if base_cmd == 0x2C else 20):
@@ -284,6 +289,24 @@ def evaluate_installability(result: dict[str, object]) -> dict[str, object]:
             "IPA is an unsigned package (no mobileprovision, no CodeResources). "
             "It CANNOT be installed directly on an iOS device in its current state. "
             "It MUST be re-signed via Sideloadly, xtool, AltStore, or TrollStore (with ldid)."
+        )
+    elif has_codesign and not has_provision:
+        state = "PARTIAL_SIGNATURE_MISSING_PROVISION"
+        warnings.append(
+            "Bundle contains _CodeSignature/CodeResources without embedded.mobileprovision."
+        )
+        summary = (
+            "IPA has CodeResources but is missing embedded.mobileprovision (partial signature state). "
+            "It CANNOT be installed directly via standard sideloading without full re-signing + provisioning."
+        )
+    elif has_provision and not has_codesign:
+        state = "PARTIAL_PROVISION_MISSING_CODESIGN"
+        warnings.append(
+            "Bundle contains embedded.mobileprovision without _CodeSignature/CodeResources."
+        )
+        summary = (
+            "IPA has embedded.mobileprovision but is missing _CodeSignature/CodeResources (partial signature state). "
+            "It CANNOT be installed directly on device without re-signing."
         )
     elif stale_detected:
         state = "STALE_SIGNATURE_MISMATCH"

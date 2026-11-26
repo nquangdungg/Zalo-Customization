@@ -1,5 +1,6 @@
 // language: Objective-C, file: ZLModCore.m, target: iOS 15.1+ (Zalo 26.10.02 & 26.11.01, arm64)
-// Initialization, lifecycle, redacted bounded logging, module status registry,
+// Initialization, two-phase thread-safe boot (background-safe + main-thread UIKit),
+// redacted bounded logging (including Discord webhook secrets), module status registry,
 // and login/logout session notifications.
 
 #import "ZLMod.h"
@@ -9,10 +10,6 @@
 NSString *const ZLModAccountDidChangeNotification = @"ZLModAccountDidChangeNotification";
 NSString *const ZLModModuleStatusNotInstalled = @"NOT_INSTALLED";
 NSString *const ZLModModuleStatusHookInstalled = @"HOOK_INSTALLED";
-
-static const NSUInteger kZLModRingBufferCapacity = 200;
-static const unsigned long long kZLModMaxLogFileBytes = 512ULL * 1024ULL;
-static const NSUInteger kZLModKeepTailBytes = 256U * 1024U;
 
 static os_unfair_lock gLogRingLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableArray<NSString *> *gLogRingBuffer = nil;
@@ -24,21 +21,31 @@ static NSMutableDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *
 
 NSString *ZLModRedactText(NSString *input) {
     if (!input || input.length == 0) return input ?: @"";
+    static NSRegularExpression *discordWebhookRegex = nil;
+    static NSRegularExpression *genericWebhookRegex = nil;
     static NSRegularExpression *querySecretRegex = nil;
     static NSRegularExpression *bearerRegex = nil;
     static NSRegularExpression *longDigitsRegex = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        discordWebhookRegex = [NSRegularExpression
+            regularExpressionWithPattern:@"(https?://(?:(?:ptb|canary)\\.)?discord(?:app)?\\.com/api(?:/v[0-9]+)?/webhooks/[0-9]+/)[^\\s\"'&?#]+"
+                                 options:NSRegularExpressionCaseInsensitive
+                                   error:nil];
+        genericWebhookRegex = [NSRegularExpression
+            regularExpressionWithPattern:@"(/webhooks/[0-9]+/)[^\\s\"'&?#]+"
+                                 options:NSRegularExpressionCaseInsensitive
+                                   error:nil];
         querySecretRegex = [NSRegularExpression
-            regularExpressionWithPattern:@"((?:access_token|token|session|auth|sig|secret|password|pwd)=)([^&\\s]+)"
+            regularExpressionWithPattern:@"((?:access_token|api_key|apikey|token|session|auth|sig|secret|password|pwd|webhook)=)([^&\\s\"']+)"
                                  options:NSRegularExpressionCaseInsensitive
                                    error:nil];
         bearerRegex = [NSRegularExpression
             regularExpressionWithPattern:@"(Bearer\\s+)[A-Za-z0-9._\\-+/=]+"
                                  options:NSRegularExpressionCaseInsensitive
                                    error:nil];
-        // Redact 10+ digit numbers (user IDs / phone numbers) while leaving
-        // 9-digit Zalo build codes (261002802 / 261101802) and timestamps readable.
+        // Redact 10+ digit numbers (user IDs / phone numbers) while preserving
+        // 9-digit Zalo build codes (261002802 / 261101802).
         longDigitsRegex = [NSRegularExpression
             regularExpressionWithPattern:@"(?<![0-9A-Za-z_])[0-9]{10,}(?![0-9A-Za-z_])"
                                  options:0
@@ -47,6 +54,18 @@ NSString *ZLModRedactText(NSString *input) {
 
     NSString *output = input;
     @try {
+        if (discordWebhookRegex) {
+            output = [discordWebhookRegex stringByReplacingMatchesInString:output
+                                                                   options:0
+                                                                     range:NSMakeRange(0, output.length)
+                                                              withTemplate:@"$1<redacted>"];
+        }
+        if (genericWebhookRegex) {
+            output = [genericWebhookRegex stringByReplacingMatchesInString:output
+                                                                   options:0
+                                                                     range:NSMakeRange(0, output.length)
+                                                              withTemplate:@"$1<redacted>"];
+        }
         if (querySecretRegex) {
             output = [querySecretRegex stringByReplacingMatchesInString:output
                                                                 options:0
@@ -99,7 +118,7 @@ static NSArray<NSURL *> *ZLModFileLogURLs(void) {
     }
     @try {
         NSURL *group = [[NSFileManager defaultManager]
-                        containerURLForSecurityApplicationGroupIdentifier:@"group.zsettings.vn.com.vng.zingalo"];
+                        containerURLForSecurityApplicationGroupIdentifier:kZLModAppGroupSuiteName];
         if (group) [urls addObject:[group URLByAppendingPathComponent:@"ZLMod.log"]];
     } @catch (__unused NSException *e) {}
     return urls;
@@ -113,10 +132,10 @@ static void ZLModAppendRingLine(NSString *line) {
     if (!line || line.length == 0) return;
     os_unfair_lock_lock(&gLogRingLock);
     if (!gLogRingBuffer) {
-        gLogRingBuffer = [NSMutableArray arrayWithCapacity:kZLModRingBufferCapacity];
+        gLogRingBuffer = [NSMutableArray arrayWithCapacity:kZLModLogRingCapacity];
     }
     [gLogRingBuffer addObject:line];
-    while (gLogRingBuffer.count > kZLModRingBufferCapacity) {
+    while (gLogRingBuffer.count > kZLModLogRingCapacity) {
         [gLogRingBuffer removeObjectAtIndex:0];
     }
     os_unfair_lock_unlock(&gLogRingLock);
@@ -125,11 +144,11 @@ static void ZLModAppendRingLine(NSString *line) {
 static void ZLModRotateLogIfNeeded(NSFileManager *manager, NSURL *url) {
     NSDictionary *attrs = [manager attributesOfItemAtPath:url.path error:nil];
     unsigned long long size = [attrs fileSize];
-    if (size <= kZLModMaxLogFileBytes) return;
+    if (size <= kZLModLogMaxFileBytes) return;
 
     NSData *existing = [NSData dataWithContentsOfURL:url];
-    if (!existing || existing.length <= kZLModKeepTailBytes) return;
-    NSUInteger start = existing.length - kZLModKeepTailBytes;
+    if (!existing || existing.length <= kZLModLogKeepTailBytes) return;
+    NSUInteger start = existing.length - kZLModLogKeepTailBytes;
     const uint8_t *bytes = (const uint8_t *)existing.bytes;
     while (start < existing.length && bytes[start] != '\n') {
         start++;
@@ -212,7 +231,7 @@ NSArray<NSString *> *ZLModReadRecentLogs(NSUInteger maxLines) {
     if (content.length == 0) return @[];
     NSMutableArray<NSString *> *lines = [NSMutableArray array];
     for (NSString *line in [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
-        if (line.length > 0) [lines addObject:line];
+        if (line.length > 0) [lines addObject:ZLModRedactText(line)];
     }
     if (lines.count <= limit) return lines;
     return [lines subarrayWithRange:NSMakeRange(lines.count - limit, limit)];
@@ -262,8 +281,10 @@ NSDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *ZLModAllModule
 
 static void ZLModDispatchAccountChange(NSString *eventName) {
     ZLModInvalidateCachedAccountScope();
-    ZLMOD_LOG(@"session event=%@ (account scope cache invalidated)", eventName ?: @"unknown");
-    dispatch_async(dispatch_get_main_queue(), ^{
+    [ZLModPrivacyContext clearActiveContext];
+    [[ZLModMessageTapBus shared] clearDedupCache];
+    ZLMOD_LOG(@"session event=%@ (account scope & transient caches invalidated)", eventName ?: @"unknown");
+    ZLModRunOnMainThread(^{
         [[NSNotificationCenter defaultCenter] postNotificationName:ZLModAccountDidChangeNotification
                                                             object:nil
                                                           userInfo:@{ @"event": eventName ?: @"unknown" }];
@@ -298,9 +319,16 @@ static void ZLModInstallSessionLifecycleObservers(void) {
                                                   usingBlock:^(__unused NSNotification *note) {
         ZLModDispatchAccountChange(@"logout_animation");
     }];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillTerminateNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification *note) {
+        ZLModFlushDiskIOQueueSync();
+    }];
 }
 
-#pragma mark - Boot sequence
+#pragma mark - Two-Phase Boot Sequence (Phase A: Background-safe, Phase B: Main-thread UIKit)
 
 static void ZLModRunInstaller(NSString *name, void (*installer)(void)) {
     ZLMOD_LOG(@"module %@ start", name);
@@ -312,6 +340,23 @@ static void ZLModRunInstaller(NSString *name, void (*installer)(void)) {
                              exception.reason ?: @"installer threw exception");
         ZLMOD_LOG(@"module %@ failed: %@", name, exception.reason);
     }
+}
+
+static void ZLModPrewarmHookIndex(void) {
+    // Build single-pass class index for all selectors that require class-wide lookup
+    // so Privacy and Features never scan ~19k app classes repeatedly.
+    ZLModPrewarmSelectorIndex(@[
+        @"sendSeenMessageWithChatEntity:",
+        @"sendSeenMessageWithTalkTableItem:",
+        @"sendSeenMessages:messageDict:incomingData:",
+        @"enableProfileMusic",
+        @"enableProfileMusicRBT",
+        @"enableShareProfileMusic",
+        @"newFlagEnableProfileMusic",
+        @"setEnableProfileMusicLocal:",
+        @"__basicBackupGDriveSectionZInstantData",
+        @"_basicBackupGDriveSectionZInstantData"
+    ]);
 }
 
 static void ZLModBoot(void) {
@@ -330,22 +375,28 @@ static void ZLModBoot(void) {
                   [ZLModCompatibility anchorExists:@"SettingUI40TableViewController"],
                   [ZLModCompatibility anchorExists:@"ZaloTabBarViewController"]);
 
+        // Phase A (background-safe): secrets migration, class index, non-UI hooks & buses.
+        [[ZLModPreferences shared] migrateLegacySecretsToKeychainIfNeeded];
+        ZLModPrewarmHookIndex();
         ZLModInstallSessionLifecycleObservers();
 
+        ZLModRunInstaller(@"MessageTap", ZLModMessageTapInstall);
         ZLModRunInstaller(@"URIFilter", ZLModURIFilterInstall);
         ZLModRunInstaller(@"Privacy", ZLModPrivacyInstall);
         ZLModRunInstaller(@"Ads", ZLModAdsInstall);
         ZLModRunInstaller(@"Features", ZLModFeaturesInstall);
-        ZLModRunInstaller(@"Settings", ZLModSettingsInstall);
-        ZLModRunInstaller(@"Glass", ZLModGlassInstall);
-        ZLModRunInstaller(@"ConversationMenu", ZLModConversationMenuInstall);
         ZLModRunInstaller(@"AntiRecall", ZLModAntiRecallInstall);
         ZLModRunInstaller(@"Utilities", ZLModUtilitiesInstall);
-        ZLModRunInstaller(@"Theme", ZLModThemeInstall);
         ZLModRunInstaller(@"Bridge", ZLModBridgeInstall);
 
-        ZLMOD_LOG(@"boot complete");
-        dispatch_async(dispatch_get_main_queue(), ^{
+        // Phase B (strictly on Main Thread): UIKit-touching installers + startup toast.
+        ZLModRunOnMainThread(^{
+            ZLModRunInstaller(@"Settings", ZLModSettingsInstall);
+            ZLModRunInstaller(@"Glass", ZLModGlassInstall);
+            ZLModRunInstaller(@"ConversationMenu", ZLModConversationMenuInstall);
+            ZLModRunInstaller(@"Theme", ZLModThemeInstall);
+
+            ZLMOD_LOG(@"boot complete");
             ZLModShowToast(@"✨ ZLMod Customize đã kích hoạt! Lắc máy hoặc vào Cài đặt để mở menu.");
         });
     });
@@ -367,39 +418,36 @@ static void ZLModScheduleBootAfterLaunch(void) {
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil
-                          queue:nil
-                     usingBlock:^(NSNotification *note) {
-                         (void)note;
-                         ZLMOD_LOG(@"boot: DidFinishLaunching notification received");
-                         ZLModBootAsync();
-                     }];
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(__unused NSNotification *note) {
+                        ZLMOD_LOG(@"boot: DidFinishLaunching notification received");
+                        ZLModBootAsync();
+                    }];
 
-        // Safety net: the dylib constructor can run after the notification
-        // already fired (late injection), so the observer above can miss it.
-        // A 5s main-queue timer force-runs boot when no path ran it yet.
+        // Safety net: late injection may miss DidFinishLaunching.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             ZLMOD_LOG(@"boot: 5s fallback timer fired — ensuring boot");
             ZLModBootAsync();
         });
 
-        // Late-injection window check: if a window already exists at
-        // constructor time the host is already running — boot in 1s so the
-        // visible Settings screen still gets its injection attempt.
-        @try {
-            if (ZLModActiveKeyWindow() != nil) {
-                ZLMOD_LOG(@"boot: window already present at constructor — scheduling boot in 1s");
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    ZLMOD_LOG(@"boot: 1s late-injection timer fired — ensuring boot");
-                    ZLModBootAsync();
-                });
-            } else {
-                ZLMOD_LOG(@"boot: no window at constructor time — waiting for DidFinishLaunching");
+        // Main-thread late-injection window check (never touches UIKit off main thread).
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                if (ZLModActiveKeyWindow() != nil) {
+                    ZLMOD_LOG(@"boot: window already present — scheduling boot in 1s");
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        ZLMOD_LOG(@"boot: 1s late-injection timer fired — ensuring boot");
+                        ZLModBootAsync();
+                    });
+                } else {
+                    ZLMOD_LOG(@"boot: no window at constructor time — waiting for DidFinishLaunching");
+                }
+            } @catch (NSException *exception) {
+                ZLMOD_LOG(@"boot: window check threw (%@) — relying on notification + 5s fallback", exception.reason);
             }
-        } @catch (NSException *exception) {
-            ZLMOD_LOG(@"boot: window check threw (%@) — relying on notification + 5s fallback", exception.reason);
-        }
+        });
     });
 }
 

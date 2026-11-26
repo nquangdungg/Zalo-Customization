@@ -143,6 +143,41 @@ def find_first_section_offset(data: bytes) -> int:
 
     return min_offset
 
+def verify_macho_alignment_slice(data: bytes) -> None:
+    """Verify every Mach-O 64-bit load command has 8-byte aligned cmdsize and sizeofcmds."""
+    hdr = inspect_macho_header(data)
+    ncmds = hdr["ncmds"]
+    sizeofcmds = hdr["sizeofcmds"]
+    if sizeofcmds % 8 != 0:
+        raise ValueError(f"Mach-O 64-bit sizeofcmds must be 8-byte aligned, got {sizeofcmds}")
+    offset = 32
+    end = 32 + sizeofcmds
+    if end > len(data):
+        raise ValueError(f"Mach-O load commands exceed file size ({end} > {len(data)})")
+    for idx in range(ncmds):
+        if offset + 8 > end:
+            raise ValueError(f"Mach-O load command {idx} truncated at offset {offset}")
+        cmd, cmdsize = struct.unpack("<II", data[offset:offset + 8])
+        if cmdsize < 8 or cmdsize % 8 != 0:
+            raise ValueError(
+                f"Mach-O 64-bit load command {idx} (cmd={hex(cmd)}) has non-8-byte-aligned cmdsize={cmdsize}"
+            )
+        if offset + cmdsize > end:
+            raise ValueError(f"Mach-O load command {idx} overflows sizeofcmds")
+        offset += cmdsize
+    if offset != end:
+        raise ValueError(f"Mach-O load command walk ended at {offset}, expected {end}")
+
+
+def verify_macho_alignment(data: bytes) -> None:
+    """Verify 8-byte load command alignment on a thin 64-bit or FAT Mach-O binary."""
+    if is_fat_macho(data):
+        for offset, size in parse_fat_slices(data):
+            verify_macho_alignment_slice(data[offset:offset + size])
+        return
+    verify_macho_alignment_slice(data)
+
+
 def inject_rpath_slice(data: bytes, rpath: str) -> bytes:
     existing = get_rpaths(data)
     if rpath in existing:
@@ -155,8 +190,10 @@ def inject_rpath_slice(data: bytes, rpath: str) -> bytes:
 
     cmd_type = LC_RPATH
     rpath_bytes = rpath.encode("utf-8") + b"\x00"
-    padded_len = align8(len(rpath_bytes))
-    cmdsize = 12 + padded_len
+    # struct rpath_command has 12-byte header (cmd, cmdsize, path.offset);
+    # Mach-O 64-bit requires TOTAL cmdsize to be 8-byte aligned.
+    cmdsize = align8(12 + len(rpath_bytes))
+    pad_len = cmdsize - 12 - len(rpath_bytes)
 
     gap_start = 32 + sizeofcmds
     gap_available = first_sec_offset - gap_start
@@ -171,11 +208,13 @@ def inject_rpath_slice(data: bytes, rpath: str) -> bytes:
         return data
 
     cmd_bytes = struct.pack("<III", cmd_type, cmdsize, 12)
-    cmd_bytes += rpath_bytes + (b"\x00" * (padded_len - len(rpath_bytes)))
+    cmd_bytes += rpath_bytes + (b"\x00" * pad_len)
+    assert cmdsize % 8 == 0, f"LC_RPATH cmdsize must be 8-byte aligned, got {cmdsize}"
     assert len(cmd_bytes) == cmdsize
 
     new_ncmds = ncmds + 1
     new_sizeofcmds = sizeofcmds + cmdsize
+    assert new_sizeofcmds % 8 == 0, f"New sizeofcmds must be 8-byte aligned, got {new_sizeofcmds}"
     new_header = struct.pack(
         "<IIIIIIII",
         hdr["magic"],
@@ -202,8 +241,10 @@ def inject_rpath_slice(data: bytes, rpath: str) -> bytes:
     else:
         ba[gap_start:gap_start + cmdsize] = cmd_bytes
 
-    print(f"[+] Successfully injected LC_RPATH: '{rpath}'")
-    return bytes(ba)
+    result = bytes(ba)
+    verify_macho_alignment_slice(result)
+    print(f"[+] Successfully injected LC_RPATH: '{rpath}' (cmdsize={cmdsize}, 8-byte aligned)")
+    return result
 
 def inject_rpath(data: bytes, rpath: str) -> bytes:
     if is_fat_macho(data):
@@ -286,12 +327,14 @@ def inject_load_dylib_slice(data: bytes, dylib_path: str, weak: bool = False) ->
     else:
         ba[gap_start:gap_start + cmdsize] = cmd_bytes
 
+    result = bytes(ba)
+    verify_macho_alignment_slice(result)
     print(f"[+] Successfully injected {'LC_LOAD_WEAK_DYLIB' if weak else 'LC_LOAD_DYLIB'}: '{dylib_path}'")
     print(f"    New ncmds: {new_ncmds} (was {ncmds})")
     print(f"    New sizeofcmds: {new_sizeofcmds} (was {sizeofcmds})")
     print(f"    Remaining padding gap: {gap_available - cmdsize} bytes")
 
-    return bytes(ba)
+    return result
 
 def inject_load_dylib(data: bytes, dylib_path: str, weak: bool = False) -> bytes:
     """

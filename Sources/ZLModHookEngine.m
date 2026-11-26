@@ -1,8 +1,12 @@
 // language: Objective-C, file: ZLModHookEngine.m, target: iOS 15.1+ (Zalo 26.10.02 & 26.11.01, arm64)
-// Runtime discovery, strictly validated instance/class method replacement,
-// and ABI-verified property inspection helpers.
+// Runtime discovery with single-pass class/selector indexing, strictly validated
+// instance/class method replacement, ABI-verified property readers, and main-thread UIKit helpers.
 
 #import "ZLMod.h"
+#import <os/lock.h>
+
+static os_unfair_lock gSelectorIndexLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary<NSString *, NSArray<Class> *> *gSelectorIndex = nil;
 
 BOOL ZLModIsAppRelatedClass(Class cls) {
     if (!cls) return NO;
@@ -58,7 +62,7 @@ static NSArray<Class> *ZLModAppClassList(void) {
             }
         }
         cached = [result copy];
-        NSLog(@"[ZLMod] app class list cached: %lu classes", (unsigned long)cached.count);
+        ZLMOD_LOG(@"app class list cached: %lu classes", (unsigned long)cached.count);
     });
     return cached;
 }
@@ -66,6 +70,74 @@ static NSArray<Class> *ZLModAppClassList(void) {
 void ZLModEnumerateAppClasses(void (^enumerator)(Class cls)) {
     if (!enumerator) return;
     for (Class cls in ZLModAppClassList()) enumerator(cls);
+}
+
+void ZLModPrewarmSelectorIndex(NSArray<NSString *> *selectorNames) {
+    if (selectorNames.count == 0) return;
+
+    NSMutableArray<NSString *> *missingNames = [NSMutableArray array];
+    os_unfair_lock_lock(&gSelectorIndexLock);
+    if (!gSelectorIndex) {
+        gSelectorIndex = [NSMutableDictionary dictionary];
+    }
+    for (NSString *name in selectorNames) {
+        if ([name isKindOfClass:[NSString class]] && name.length > 0 && !gSelectorIndex[name]) {
+            [missingNames addObject:name];
+        }
+    }
+    os_unfair_lock_unlock(&gSelectorIndexLock);
+
+    if (missingNames.count == 0) return;
+
+    NSUInteger selCount = missingNames.count;
+    SEL *sels = (SEL *)malloc(sizeof(SEL) * selCount);
+    NSMutableArray<NSMutableArray<Class> *> *buckets = [NSMutableArray arrayWithCapacity:selCount];
+    if (!sels) return;
+
+    for (NSUInteger i = 0; i < selCount; i++) {
+        sels[i] = sel_registerName(missingNames[i].UTF8String);
+        [buckets addObject:[NSMutableArray array]];
+    }
+
+    // Single pass across all app classes for all requested selectors.
+    NSArray<Class> *allClasses = ZLModAppClassList();
+    for (Class cls in allClasses) {
+        for (NSUInteger i = 0; i < selCount; i++) {
+            if (sels[i] && class_getInstanceMethod(cls, sels[i]) != NULL) {
+                [buckets[i] addObject:cls];
+            }
+        }
+    }
+    free(sels);
+
+    os_unfair_lock_lock(&gSelectorIndexLock);
+    for (NSUInteger i = 0; i < selCount; i++) {
+        gSelectorIndex[missingNames[i]] = [buckets[i] copy];
+    }
+    os_unfair_lock_unlock(&gSelectorIndexLock);
+
+    ZLMOD_LOG(@"selector index built in single pass (%lu selectors across %lu classes)",
+              (unsigned long)selCount, (unsigned long)allClasses.count);
+}
+
+NSArray<Class> *ZLModClassesImplementingInstanceSelector(SEL sel) {
+    if (!sel) return @[];
+    const char *rawName = sel_getName(sel);
+    if (!rawName) return @[];
+    NSString *selName = [NSString stringWithUTF8String:rawName];
+    if (selName.length == 0) return @[];
+
+    os_unfair_lock_lock(&gSelectorIndexLock);
+    NSArray<Class> *cached = gSelectorIndex[selName];
+    os_unfair_lock_unlock(&gSelectorIndexLock);
+    if (cached) return cached;
+
+    ZLModPrewarmSelectorIndex(@[selName]);
+
+    os_unfair_lock_lock(&gSelectorIndexLock);
+    cached = gSelectorIndex[selName] ?: @[];
+    os_unfair_lock_unlock(&gSelectorIndexLock);
+    return cached;
 }
 
 static BOOL ZLModValidateAndReplace(Class cls, BOOL isClassMethod, SEL sel,
@@ -210,7 +282,9 @@ double ZLModSafeDoubleProperty(id obj, SEL sel, double defaultValue) {
     return defaultValue;
 }
 
-UIWindow *ZLModActiveKeyWindow(void) {
+#pragma mark - Main-thread guaranteed UIKit window & presenter helpers
+
+static UIWindow *ZLModActiveKeyWindowOnMain(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return nil;
     UIWindow *fallback = nil;
@@ -226,8 +300,19 @@ UIWindow *ZLModActiveKeyWindow(void) {
     return fallback;
 }
 
-UIViewController *ZLModTopPresenterViewController(void) {
-    UIWindow *win = ZLModActiveKeyWindow();
+UIWindow *ZLModActiveKeyWindow(void) {
+    if ([NSThread isMainThread]) {
+        return ZLModActiveKeyWindowOnMain();
+    }
+    __block UIWindow *win = nil;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        win = ZLModActiveKeyWindowOnMain();
+    });
+    return win;
+}
+
+static UIViewController *ZLModTopPresenterOnMain(void) {
+    UIWindow *win = ZLModActiveKeyWindowOnMain();
     UIViewController *top = win.rootViewController;
     while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) {
         top = top.presentedViewController;
@@ -240,4 +325,39 @@ UIViewController *ZLModTopPresenterViewController(void) {
         if (tab.selectedViewController) top = tab.selectedViewController;
     }
     return top;
+}
+
+UIViewController *ZLModTopPresenterViewController(void) {
+    if ([NSThread isMainThread]) {
+        return ZLModTopPresenterOnMain();
+    }
+    __block UIViewController *top = nil;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        top = ZLModTopPresenterOnMain();
+    });
+    return top;
+}
+
+static UIView *ZLModFindActiveTextInputInView(UIView *view) {
+    if (!view || view.hidden) return nil;
+    if (view.isFirstResponder &&
+        ([view isKindOfClass:[UITextView class]] ||
+         [view isKindOfClass:[UITextField class]] ||
+         [view conformsToProtocol:@protocol(UITextInput)])) {
+        return view;
+    }
+    for (UIView *sub in view.subviews) {
+        UIView *found = ZLModFindActiveTextInputInView(sub);
+        if (found) return found;
+    }
+    return nil;
+}
+
+BOOL ZLModIsAnyTextInputActive(void) {
+    __block BOOL active = NO;
+    ZLModRunOnMainThreadSync(^{
+        UIWindow *win = ZLModActiveKeyWindowOnMain();
+        active = (ZLModFindActiveTextInputInView(win) != nil);
+    });
+    return active;
 }
