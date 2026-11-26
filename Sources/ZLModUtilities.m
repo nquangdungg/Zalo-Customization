@@ -804,6 +804,10 @@ static void ZLModAttachQuickReplyButtonToChatVC(UIViewController *vc) {
 @property (nonatomic, assign) IMP origSendChatIMP;
 @property (nonatomic, strong) dispatch_source_t bannerTickTimer;
 @property (nonatomic, assign) CGFloat keyboardOverlapHeight;
+- (void)enqueueSendFromManager:(id)manager
+                    chatEntity:(id)chatEntity
+                   checkUpload:(BOOL)checkUpload
+                       origIMP:(IMP)origIMP;
 @end
 
 @implementation ZLModDelaySendManager

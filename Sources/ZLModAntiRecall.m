@@ -43,6 +43,10 @@ static void ZLModClearUnhiddenMessages(void);
 @property (nonatomic, strong) NSMutableArray<ZLModLiveMessageSnapshot *> *liveOrder;
 @property (nonatomic, copy) NSString *storagePath;
 @property (nonatomic, copy) NSString *photoDirectoryPath;
+- (void)cacheLiveSnapshotFromModel:(ZLModMessageModel *)model photoImage:(UIImage *)photoImage;
+- (ZLModLiveMessageSnapshot *)liveSnapshotForAccountScope:(NSString *)scope
+                                                 globalId:(int64_t)globalId
+                                                 clientId:(int64_t)clientId;
 @end
 
 @implementation ZLModAntiRecallStore
@@ -975,7 +979,7 @@ static id ZLModMakeRecallMenuItem(id template, NSString *title, NSString *symbol
 @property (nonatomic, strong) UINavigationBar *navBar;
 @property (nonatomic, strong) UIView *bottomBar;
 @property (nonatomic, strong) UIButton *saveBtn;
-@property (nonatomic, strong) UIButton *copyBtn;
+@property (nonatomic, strong) UIButton *clipboardBtn;
 @end
 
 @implementation ZLModPhotoPreviewViewController
@@ -1033,15 +1037,15 @@ static id ZLModMakeRecallMenuItem(id template, NSString *title, NSString *symbol
     [self.saveBtn addTarget:self action:@selector(saveTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.bottomBar addSubview:self.saveBtn];
 
-    self.copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.copyBtn setTitle:@" Sao chép ảnh" forState:UIControlStateNormal];
-    [self.copyBtn setImage:[UIImage systemImageNamed:@"doc.on.doc"] forState:UIControlStateNormal];
-    [self.copyBtn setTintColor:[UIColor whiteColor]];
-    self.copyBtn.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
-    self.copyBtn.titleLabel.adjustsFontForContentSizeCategory = YES;
-    self.copyBtn.accessibilityLabel = @"Sao chép ảnh vào bộ nhớ tạm";
-    [self.copyBtn addTarget:self action:@selector(copyTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self.bottomBar addSubview:self.copyBtn];
+    self.clipboardBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.clipboardBtn setTitle:@" Sao chép ảnh" forState:UIControlStateNormal];
+    [self.clipboardBtn setImage:[UIImage systemImageNamed:@"doc.on.doc"] forState:UIControlStateNormal];
+    [self.clipboardBtn setTintColor:[UIColor whiteColor]];
+    self.clipboardBtn.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+    self.clipboardBtn.titleLabel.adjustsFontForContentSizeCategory = YES;
+    self.clipboardBtn.accessibilityLabel = @"Sao chép ảnh vào bộ nhớ tạm";
+    [self.clipboardBtn addTarget:self action:@selector(handleCopyTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.bottomBar addSubview:self.clipboardBtn];
 }
 
 - (void)viewDidLayoutSubviews {
@@ -1056,7 +1060,7 @@ static id ZLModMakeRecallMenuItem(id template, NSString *title, NSString *symbol
     self.navBar.frame = CGRectMake(0.0, topSafe, w, navH);
     self.bottomBar.frame = CGRectMake(0.0, h - bottomH, w, bottomH);
     self.saveBtn.frame = CGRectMake(16.0, 10.0, 150.0, 44.0);
-    self.copyBtn.frame = CGRectMake(w - 166.0, 10.0, 150.0, 44.0);
+    self.clipboardBtn.frame = CGRectMake(w - 166.0, 10.0, 150.0, 44.0);
 
     CGRect imgRect = CGRectMake(0.0, topSafe + navH, w, MAX(h - topSafe - navH - bottomH, 100.0));
     self.scrollView.zoomScale = 1.0;
@@ -1085,7 +1089,7 @@ static id ZLModMakeRecallMenuItem(id template, NSString *title, NSString *symbol
 
 - (void)saveTapped {
     if (self.photo) {
-        UIImageWriteToSavedPhotosAlbum(self.photo, self, @selector(image:didFinishSavingWithError:contextInfo:), nil);
+        UIImageWriteToSavedPhotosAlbum(self.photo, self, @selector(image:didFinishSavingWithError:contextInfo:), NULL);
     }
 }
 
@@ -1097,7 +1101,7 @@ static id ZLModMakeRecallMenuItem(id template, NSString *title, NSString *symbol
     }
 }
 
-- (void)copyTapped {
+- (void)handleCopyTapped {
     if (self.photo) {
         [UIPasteboard generalPasteboard].image = self.photo;
         ZLModShowToast(@"Đã sao chép ảnh vào bộ nhớ tạm");

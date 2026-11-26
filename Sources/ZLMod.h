@@ -9,6 +9,7 @@
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <float.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>

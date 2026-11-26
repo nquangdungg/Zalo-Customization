@@ -388,9 +388,10 @@ class SecurityAnchorsAndMachOTests(unittest.TestCase):
             )
             self.assertEqual(1, len(defs), f"Expected exactly 1 definition for {fn}, found {len(defs)}")
 
-        # 7. Required system headers present (Security, os/lock, math, arpa/inet, string, stdlib, stdarg)
+        # 7. Required system headers present (Security, os/lock, math, arpa/inet, float, string, stdlib, stdarg)
         zlmod_h_text = (SOURCES / "ZLMod.h").read_text(encoding="utf-8")
         self.assertIn("<Security/Security.h>", zlmod_h_text)
+        self.assertIn("<float.h>", zlmod_h_text)
         self.assertIn("<string.h>", zlmod_h_text)
         self.assertIn("<stdlib.h>", zlmod_h_text)
         self.assertIn("<stdarg.h>", zlmod_h_text)
@@ -400,6 +401,226 @@ class SecurityAnchorsAndMachOTests(unittest.TestCase):
         self.assertIn("discord(?:app)?\\\\.com/api", core_text)
         self.assertIn("Bearer", core_text)
         self.assertIn("webhook", core_text)
+
+    # Area 26: Clang ARC Cocoa ownership naming & strict @interface visibility regression guard
+    def test_26_objc_arc_ownership_naming_and_interface_visibility(self):
+        h_files = sorted(SOURCES.glob("*.h"))
+        m_files = sorted(SOURCES.glob("*.m"))
+        all_files = h_files + m_files
+
+        def arc_family(name: str):
+            stripped = name.lstrip("_")
+            for fam in ("alloc", "new", "copy", "mutableCopy", "init"):
+                if stripped.startswith(fam):
+                    rest = stripped[len(fam) :]
+                    if rest == "" or not rest[0].islower():
+                        return fam
+            return None
+
+        # 1. Verify zero ARC Cocoa ownership naming violations on properties & methods
+        for path in all_files:
+            cleaned = strip_objc_comments_and_strings(path.read_text(encoding="utf-8"))
+            for lineno, line in enumerate(cleaned.splitlines(), 1):
+                pm = re.match(r"^\s*@property\s*(?:\(([^)]*)\))?\s*(.+?);", line)
+                if pm:
+                    attrs, decl = pm.group(1) or "", pm.group(2).strip()
+                    bm = re.search(r"\(\s*\^\s*(\w+)\s*\)", decl)
+                    prop_name = bm.group(1) if bm else (re.search(r"(\w+)\s*$", decl).group(1) if re.search(r"(\w+)\s*$", decl) else "")
+                    gm = re.search(r"getter\s*=\s*(\w+)", attrs)
+                    getter = gm.group(1) if gm else prop_name
+                    fam = arc_family(getter)
+                    self.assertIsNone(
+                        fam,
+                        f"{path.name}:{lineno} property '{prop_name}' (getter '{getter}') violates ARC '{fam}' ownership naming",
+                    )
+
+                mm = re.match(r"^\s*([-+])\s*\(([^)]+)\)\s*([A-Za-z_]\w*)", line)
+                if mm:
+                    ret, first_sel = mm.group(2).strip(), mm.group(3)
+                    fam = arc_family(first_sel)
+                    if fam == "init":
+                        is_obj = ret in ("instancetype", "id") or "*" in ret
+                        self.assertTrue(
+                            is_obj,
+                            f"{path.name}:{lineno} init-family method '{first_sel}' returns non-object '{ret}'",
+                        )
+                    elif fam in ("alloc", "new", "copy", "mutableCopy"):
+                        self.assertEqual(
+                            "copyWithZone",
+                            first_sel,
+                            f"{path.name}:{lineno} method '{first_sel}' (returns '{ret}') falls into ARC '{fam}' family",
+                        )
+
+        # 2. Verify strict @interface visibility for every [[ZLMod* shared/alloc] ...] and [ZLMod* ...] call
+        iface_global = {}
+        iface_file = {}
+        impl_file = {}
+        class_super = {}
+
+        def extract_selector(sig: str):
+            sig = re.sub(r"\s+", " ", sig).strip()
+            if ":" in sig:
+                parts = re.findall(r"([A-Za-z_]\w*)\s*:", sig)
+                return ":".join(parts) + ":" if parts else None
+            sm = re.match(r"([A-Za-z_]\w*)", sig)
+            return sm.group(1) if sm else None
+
+        def parse_objc(files, is_header: bool):
+            for path in files:
+                bn = path.name
+                lines = strip_objc_comments_and_strings(path.read_text(encoding="utf-8")).splitlines()
+                mode, cls = None, None
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    mi = re.match(r"^\s*@interface\s+(\w+)\s*(?::\s*(\w+))?", line)
+                    mimpl = re.match(r"^\s*@implementation\s+(\w+)", line)
+                    if mi:
+                        mode, cls = "iface", mi.group(1)
+                        if mi.group(2):
+                            class_super[cls] = mi.group(2)
+                    elif mimpl:
+                        mode, cls = "impl", mimpl.group(1)
+                    elif re.match(r"^\s*@end\b", line):
+                        mode, cls = None, None
+                    elif cls:
+                        mp = re.match(r"^\s*@property\s*(?:\(([^)]*)\))?\s*(.+?);", line)
+                        if mp and mode == "iface":
+                            attrs, decl = mp.group(1) or "", mp.group(2).strip()
+                            bm = re.search(r"\(\s*\^\s*(\w+)\s*\)", decl)
+                            prop_name = bm.group(1) if bm else (re.search(r"(\w+)\s*$", decl).group(1) if re.search(r"(\w+)\s*$", decl) else "")
+                            if prop_name:
+                                gm = re.search(r"getter\s*=\s*(\w+)", attrs)
+                                getter = gm.group(1) if gm else prop_name
+                                sels = [getter]
+                                if "readonly" not in attrs:
+                                    sels.append("set" + prop_name[0].upper() + prop_name[1:] + ":")
+                                bucket = iface_global.setdefault(cls, set()) if is_header else iface_file.setdefault(bn, {}).setdefault(cls, set())
+                                bucket.update(sels)
+                        mm = re.match(r"^\s*([-+])\s*\([^)]+\)\s*(.*)", line)
+                        if mm:
+                            sig = mm.group(2)
+                            j = i
+                            while ";" not in sig and "{" not in sig and j + 1 < len(lines):
+                                j += 1
+                                sig += " " + lines[j]
+                            sel = extract_selector(re.split(r"[;{]", sig)[0])
+                            if sel:
+                                if mode == "iface":
+                                    bucket = iface_global.setdefault(cls, set()) if is_header else iface_file.setdefault(bn, {}).setdefault(cls, set())
+                                else:
+                                    bucket = impl_file.setdefault(bn, {}).setdefault(cls, set())
+                                bucket.add(sel)
+                    i += 1
+
+        parse_objc(h_files, True)
+        parse_objc(m_files, False)
+
+        std_methods = {
+            "alloc", "init", "new", "shared", "class", "isKindOfClass:", "respondsToSelector:",
+            "copy", "mutableCopy", "initWithStyle:", "initWithNibName:bundle:",
+            "initWithRootViewController:", "view", "navigationItem", "navigationController",
+        }
+
+        def visible_for(bn: str, cls: str, in_impl):
+            vis = set(std_methods)
+            cur = cls
+            seen = set()
+            while cur and cur not in seen:
+                seen.add(cur)
+                vis |= iface_global.get(cur, set())
+                vis |= iface_file.get(bn, {}).get(cur, set())
+                if in_impl == cur:
+                    vis |= impl_file.get(bn, {}).get(cur, set())
+                cur = class_super.get(cur)
+            return vis
+
+        def parse_call_selector(text: str, start: int):
+            depth_sq, depth_par, depth_cur = 1, 0, 0
+            top = []
+            i = start
+            while i < len(text) and depth_sq > 0:
+                ch = text[i]
+                if ch == "[":
+                    depth_sq += 1
+                elif ch == "]":
+                    depth_sq -= 1
+                    if depth_sq == 0:
+                        break
+                elif ch == "(":
+                    depth_par += 1
+                elif ch == ")":
+                    depth_par -= 1
+                elif ch == "{":
+                    depth_cur += 1
+                elif ch == "}":
+                    depth_cur -= 1
+                elif depth_sq == 1 and depth_par == 0 and depth_cur == 0:
+                    top.append(ch)
+                i += 1
+            body = "".join(top).strip()
+            if not body:
+                return None
+            if ":" in body:
+                if "?" in body:
+                    fm = re.match(r"^([A-Za-z_]\w*)\s*:", body)
+                    return (fm.group(1) + ":", True) if fm else None
+                parts = re.findall(r"([A-Za-z_]\w*)\s*:", body)
+                return (":".join(parts) + ":", False) if parts else None
+            sm = re.match(r"^([A-Za-z_]\w*)\s*$", body)
+            return (sm.group(1), False) if sm else None
+
+        for path in m_files:
+            bn = path.name
+            cleaned = strip_objc_comments_and_strings(path.read_text(encoding="utf-8"))
+            impl_spans = []
+            for m in re.finditer(r"(?m)^\s*@implementation\s+(\w+)", cleaned):
+                end_m = re.search(r"(?m)^\s*@end\b", cleaned[m.end() :])
+                end_pos = m.end() + end_m.start() if end_m else len(cleaned)
+                impl_spans.append((m.start(), end_pos, m.group(1)))
+
+            def impl_at(pos: int):
+                for s, e, c in impl_spans:
+                    if s <= pos <= e:
+                        return c
+                return None
+
+            for m in re.finditer(r"\[\s*\[\s*(ZLMod\w+)\s+(shared|alloc)\s*\]\s+", cleaned):
+                cls = m.group(1)
+                res = parse_call_selector(cleaned, m.end())
+                if not res:
+                    continue
+                sel, is_prefix = res
+                vis = visible_for(bn, cls, impl_at(m.start()))
+                ok = any(v.startswith(sel) for v in vis) if is_prefix else (sel in vis)
+                ln = cleaned.count("\n", 0, m.start()) + 1
+                self.assertTrue(ok, f"{bn}:{ln} calls [[{cls} {m.group(2)}] {sel}] without visible @interface declaration")
+
+            for m in re.finditer(r"\b(ZLMod\w+)\s*\*\s*(\w+)\s*=", cleaned):
+                vcls, vname = m.group(1), m.group(2)
+                window = cleaned[m.end() : m.end() + 2500]
+                stop = re.search(r"(?m)^(?:@end|\}\s*$)", window)
+                if stop:
+                    window = window[: stop.start()]
+                for cm in re.finditer(rf"\[\s*{re.escape(vname)}\s+(?=[A-Za-z_])", window):
+                    res = parse_call_selector(cleaned, m.end() + cm.end())
+                    if not res:
+                        continue
+                    sel, is_prefix = res
+                    abs_pos = m.end() + cm.start()
+                    vis = visible_for(bn, vcls, impl_at(abs_pos))
+                    ok = any(v.startswith(sel) for v in vis) if is_prefix else (sel in vis)
+                    ln = cleaned.count("\n", 0, abs_pos) + 1
+                    self.assertTrue(ok, f"{bn}:{ln} calls [{vname}({vcls}) {sel}] without visible @interface declaration")
+
+        # 3. No nil passed to SEL/void* params of UIImageWriteToSavedPhotosAlbum
+        for path in m_files:
+            raw = path.read_text(encoding="utf-8")
+            for m in re.finditer(r"UIImageWriteToSavedPhotosAlbum\s*\(([^;]+)\)\s*;", raw):
+                args = [a.strip() for a in m.group(1).split(",")]
+                self.assertEqual(4, len(args), f"Unexpected arg count in {path.name}: {args}")
+                self.assertNotEqual("nil", args[2], f"{path.name}: pass NULL (not nil) for SEL param")
+                self.assertNotEqual("nil", args[3], f"{path.name}: pass NULL (not nil) for void* contextInfo")
 
 
 if __name__ == "__main__":

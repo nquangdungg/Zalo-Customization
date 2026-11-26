@@ -108,6 +108,7 @@ static NSString *ZLModBridgeStatusText(ZLModBridgeManager *mgr, UIColor **outCol
 @property (nonatomic, strong) UIImage *photoImage;
 @property (nonatomic, strong) UIScrollView *scrollView;
 @property (nonatomic, strong) UIImageView *imageView;
+- (instancetype)initWithImage:(UIImage *)image;
 @end
 
 @implementation ZLModHistoryPhotoViewerController
@@ -161,7 +162,7 @@ static NSString *ZLModBridgeStatusText(ZLModBridgeManager *mgr, UIColor **outCol
 
 - (void)saveTapped {
     if (!self.photoImage) return;
-    UIImageWriteToSavedPhotosAlbum(self.photoImage, nil, nil, nil);
+    UIImageWriteToSavedPhotosAlbum(self.photoImage, nil, NULL, NULL);
     ZLModShowToast(@"Đã lưu ảnh vào Thư viện ảnh");
 }
 
@@ -669,8 +670,9 @@ static NSString *ZLModBridgeStatusText(ZLModBridgeManager *mgr, UIColor **outCol
     NSString *compoundKey = entry[@"key"];
     if (![compoundKey isKindOfClass:[NSString class]]) return;
 
-    NSString *title = [entry[@"displayTitle"] isKindOfClass:[NSString class]] && [entry[@"displayTitle"] length] > 0
-        ? entry[@"displayTitle"]
+    NSString *displayTitle = [entry[@"displayTitle"] isKindOfClass:[NSString class]] ? entry[@"displayTitle"] : nil;
+    NSString *title = displayTitle.length > 0
+        ? displayTitle
         : (entry[@"threadHash"] ?: @"Hội thoại");
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
                                                                    message:@"Đặt lại cuộc trò chuyện này về mặc định?"
@@ -1160,7 +1162,8 @@ moveRowAtIndexPath:(NSIndexPath *)sourceIndexPath
     NSDictionary *entry = self.entries[(NSUInteger)indexPath.row];
     NSString *tid = entry[@"threadId"];
     if (tid.length == 0) return;
-    NSString *title = [entry[@"displayTitle"] length] > 0 ? entry[@"displayTitle"] : entry[@"threadHash"];
+    NSString *displayTitle = [entry[@"displayTitle"] isKindOfClass:[NSString class]] ? entry[@"displayTitle"] : nil;
+    NSString *title = displayTitle.length > 0 ? displayTitle : entry[@"threadHash"];
 
     ZLModPresentPrivateNoteEditor(self, tid, title, ^(__unused BOOL saved) {
         [self reloadNotes];
@@ -1249,15 +1252,15 @@ moveRowAtIndexPath:(NSIndexPath *)sourceIndexPath
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.estimatedRowHeight = 36.0;
 
-    UIBarButtonItem *copyBtn = [[UIBarButtonItem alloc] initWithTitle:@"Sao chép"
-                                                                style:UIBarButtonItemStylePlain
-                                                               target:self
-                                                               action:@selector(copyLogs:)];
+    UIBarButtonItem *clipboardBarBtn = [[UIBarButtonItem alloc] initWithTitle:@"Sao chép"
+                                                                        style:UIBarButtonItemStylePlain
+                                                                       target:self
+                                                                       action:@selector(handleCopyLogs:)];
     UIBarButtonItem *clearBtn = [[UIBarButtonItem alloc] initWithTitle:@"Xóa"
                                                                  style:UIBarButtonItemStylePlain
                                                                 target:self
                                                                 action:@selector(clearLogs:)];
-    self.navigationItem.rightBarButtonItems = @[clearBtn, copyBtn];
+    self.navigationItem.rightBarButtonItems = @[clearBtn, clipboardBarBtn];
 
     UIRefreshControl *rc = [[UIRefreshControl alloc] init];
     [rc addTarget:self action:@selector(refreshLogs:) forControlEvents:UIControlEventValueChanged];
@@ -1276,7 +1279,7 @@ moveRowAtIndexPath:(NSIndexPath *)sourceIndexPath
     [self.tableView reloadData];
 }
 
-- (void)copyLogs:(__unused id)sender {
+- (void)handleCopyLogs:(__unused id)sender {
     NSString *joined = [self.lines componentsJoinedByString:@"\n"];
     [UIPasteboard generalPasteboard].string = joined ?: @"";
     ZLModShowToast(@"Đã sao chép log vào bộ nhớ tạm");

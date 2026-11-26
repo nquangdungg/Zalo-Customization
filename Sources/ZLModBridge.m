@@ -542,7 +542,7 @@ static BOOL ZLModPrefNoteMatchesKeys(NSNotification *note, NSSet<NSString *> *ta
     NSString *serverUrlStr = [[ZLModPreferences shared] stringForKey:kZLModBridgeServerURL defaultValue:@""];
     if (serverUrlStr.length == 0) return;
 
-    NSUInteger cappedShift = MIN(self.reconnectAttempt, 4U);
+    NSUInteger cappedShift = MIN(self.reconnectAttempt, (NSUInteger)4);
     NSTimeInterval delay = kZLModBridgeReconnectMinSec * (double)(1U << cappedShift);
     if (delay > kZLModBridgeReconnectMaxSec) delay = kZLModBridgeReconnectMaxSec;
     self.reconnectAttempt += 1;
